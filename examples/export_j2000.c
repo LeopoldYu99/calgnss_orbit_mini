@@ -2,6 +2,8 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,8 +11,8 @@
 #define CSV_LINE_BUFFER 2048
 #define CSV_MAX_FIELDS 32
 
-static const char *k_input_csv = "..\\20260518\\67113_LLA_Position_2hour.csv";
-static const char *k_output_csv = "..\\20260518\\67113_J2000_Calculated.csv";
+static const char *k_input_csv = "..\\20260518\\67217_LLA_Position_2hour.csv";
+static const char *k_output_csv = "..\\20260518\\67217_J2000_Calculated.csv";
 static const char *k_start_time_text = "18 May 2026 04:00:00.000";
 static const char *k_end_time_text = "18 May 2026 06:59:59.000";
 static const double k_step_seconds = 1.0;
@@ -30,6 +32,184 @@ static char *csv_trim(char *s)
         ++s;
     }
     return s;
+}
+
+static int64_t example_days_from_civil(int y, unsigned m, unsigned d)
+{
+    int era;
+    unsigned yoe;
+    unsigned doy;
+    unsigned doe;
+    int mp;
+    y -= (m <= 2U);
+    era = (y >= 0 ? y : y - 399) / 400;
+    yoe = (unsigned)(y - era * 400);
+    mp = (int)m + ((m > 2U) ? -3 : 9);
+    doy = (unsigned)((153 * mp + 2) / 5) + d - 1U;
+    doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+    return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+
+static void example_civil_from_days(int64_t z, int *y, unsigned *m, unsigned *d)
+{
+    int era;
+    unsigned doe;
+    unsigned yoe;
+    unsigned doy;
+    unsigned mp;
+    z += 719468;
+    era = (int)((z >= 0 ? z : z - 146096) / 146097);
+    doe = (unsigned)(z - (int64_t)era * 146097);
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    *y = (int)yoe + era * 400;
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    mp = (5 * doy + 2) / 153;
+    *d = doy - (153 * mp + 2) / 5 + 1;
+    *m = mp + (mp < 10 ? 3U : (unsigned)-9);
+    *y += (*m <= 2U);
+}
+
+static double example_jd_from_calendar(int y, int m, int d, int hour, int minute, double second)
+{
+    int yy = y;
+    int mm = m;
+    int a;
+    int b;
+    double day;
+    if (mm <= 2) {
+        yy -= 1;
+        mm += 12;
+    }
+    a = yy / 100;
+    b = 2 - a + a / 4;
+    day = (double)d + ((double)hour + ((double)minute + second / 60.0) / 60.0) / 24.0;
+    return floor(365.25 * (double)(yy + 4716)) +
+           floor(30.6001 * (double)(mm + 1)) +
+           day + (double)b - 1524.5;
+}
+
+static cg_time_t example_time_from_calendar(int y, int m, int d, int hour, int minute, double second)
+{
+    cg_time_t t;
+    int whole_second = (int)floor(second);
+    double frac = second - (double)whole_second;
+    int64_t days = example_days_from_civil(y, (unsigned)m, (unsigned)d);
+    t.year = y;
+    t.month = m;
+    t.day = d;
+    t.hour = hour;
+    t.minute = minute;
+    t.second = second;
+    t.jd_utc = example_jd_from_calendar(y, m, d, hour, minute, second);
+    t.unix_seconds = (double)days * 86400.0 + (double)hour * 3600.0 +
+                     (double)minute * 60.0 + (double)whole_second + frac;
+    return t;
+}
+
+static cg_time_t example_time_add_seconds(const cg_time_t *time_utc, double seconds)
+{
+    double u = time_utc->unix_seconds + seconds;
+    double whole_d = floor(u);
+    int64_t whole = (int64_t)whole_d;
+    double frac = u - whole_d;
+    int64_t days = whole / 86400;
+    int64_t sod = whole % 86400;
+    int y;
+    unsigned m;
+    unsigned d;
+    int hour;
+    int minute;
+    if (sod < 0) {
+        sod += 86400;
+        days -= 1;
+    }
+    example_civil_from_days(days, &y, &m, &d);
+    hour = (int)(sod / 3600);
+    minute = (int)((sod % 3600) / 60);
+    return example_time_from_calendar(y, (int)m, (int)d, hour, minute,
+                                      (double)(sod % 60) + frac);
+}
+
+static int example_month_number(const char *month)
+{
+    static const char *names[] = {
+        "jan", "feb", "mar", "apr", "may", "jun",
+        "jul", "aug", "sep", "oct", "nov", "dec"
+    };
+    char lower[4];
+    int i;
+    for (i = 0; i < 3 && month[i]; ++i) {
+        lower[i] = (char)tolower((unsigned char)month[i]);
+    }
+    lower[i] = '\0';
+    for (i = 0; i < 12; ++i) {
+        if (strcmp(lower, names[i]) == 0) {
+            return i + 1;
+        }
+    }
+    return 0;
+}
+
+static int example_parse_time(const char *text, cg_time_t *out_time)
+{
+    char buf[128];
+    char mon[16];
+    char sep = 0;
+    int y = 0, m = 0, d = 0, hh = 0, mm = 0;
+    double ss = 0.0;
+    size_t n;
+    char *s;
+
+    if (!text || !out_time) {
+        return CG_ERR_INVALID_ARGUMENT;
+    }
+
+    n = strlen(text);
+    if (n >= sizeof(buf)) {
+        return CG_ERR_PARSE;
+    }
+    memcpy(buf, text, n + 1);
+    s = csv_trim(buf);
+    n = strlen(s);
+    if (n > 0 && s[n - 1] == 'Z') {
+        s[n - 1] = '\0';
+    }
+
+    if (sscanf(s, "%d %15s %d %d:%d:%lf", &d, mon, &y, &hh, &mm, &ss) == 6) {
+        m = example_month_number(mon);
+        if (m > 0) {
+            *out_time = example_time_from_calendar(y, m, d, hh, mm, ss);
+            return CG_OK;
+        }
+    }
+
+    if (sscanf(s, "%d-%d-%d%c%d:%d:%lf", &y, &m, &d, &sep, &hh, &mm, &ss) == 7 &&
+        (sep == ' ' || sep == 'T')) {
+        *out_time = example_time_from_calendar(y, m, d, hh, mm, ss);
+        return CG_OK;
+    }
+
+    if (sscanf(s, "%d/%d/%d%c%d:%d:%lf", &y, &m, &d, &sep, &hh, &mm, &ss) == 7 &&
+        (sep == ' ' || sep == 'T')) {
+        *out_time = example_time_from_calendar(y, m, d, hh, mm, ss);
+        return CG_OK;
+    }
+
+    return CG_ERR_PARSE;
+}
+
+static void example_format_time_iso(const cg_time_t *time_utc, char *buffer, size_t buffer_size)
+{
+    double rounded_second;
+    int sec_int;
+    if (!time_utc || !buffer || buffer_size == 0) {
+        return;
+    }
+    rounded_second = floor(time_utc->second + 0.5);
+    sec_int = (int)rounded_second;
+    snprintf(buffer, buffer_size, "%04d-%02d-%02d %02d:%02d:%02d",
+             time_utc->year, time_utc->month, time_utc->day,
+             time_utc->hour, time_utc->minute, sec_int);
 }
 
 static int csv_split_line(char *line, char **fields, int max_fields)
@@ -175,7 +355,7 @@ static int load_lla_csv(const char *path, cg_observation_t **out_observations, s
             continue;
         }
         memset(&item, 0, sizeof(item));
-        if (cg_parse_time(fields[time_col], &item.time_utc) != CG_OK) {
+        if (example_parse_time(fields[time_col], &item.time_utc) != CG_OK) {
             free(observations);
             fclose(f);
             return CG_ERR_PARSE;
@@ -269,7 +449,7 @@ static int export_j2000_csv(
             return status;
         }
 
-        cg_format_time_iso(&current, time_text, sizeof(time_text));
+        example_format_time_iso(&current, time_text, sizeof(time_text));
         fprintf(out, "%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
                 time_text,
                 state.r_j2000_m.x / 1000.0,
@@ -278,7 +458,7 @@ static int export_j2000_csv(
                 state.v_j2000_mps.x / 1000.0,
                 state.v_j2000_mps.y / 1000.0,
                 state.v_j2000_mps.z / 1000.0);
-        current = cg_time_add_seconds(&current, step_seconds);
+        current = example_time_add_seconds(&current, step_seconds);
     }
 
     fclose(out);
@@ -294,7 +474,7 @@ static int parse_config_time(const char *label, const char *text, cg_time_t *tim
         return CG_OK;
     }
 
-    status = cg_parse_time(text, time);
+    status = example_parse_time(text, time);
     if (status != CG_OK) {
         fprintf(stderr, "Invalid %s time: %s\n", label, text);
         return status;

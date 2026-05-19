@@ -58,11 +58,6 @@ typedef enum cg_status_t {
 
 cg_options_t cg_default_options(void);
 
-int cg_parse_time(const char *text, cg_time_t *out_time);
-void cg_format_time_iso(const cg_time_t *time_utc, char *buffer, size_t buffer_size);
-double cg_seconds_between(const cg_time_t *a, const cg_time_t *b);
-cg_time_t cg_time_add_seconds(const cg_time_t *time_utc, double seconds);
-
 int cg_precompute_observations(cg_observation_t *observations, size_t count);
 
 int cg_query_state(

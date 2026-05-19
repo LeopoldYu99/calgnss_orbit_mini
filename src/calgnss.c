@@ -1,10 +1,8 @@
 #include "calgnss.h"
 
-#include <ctype.h>
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 #ifndef CG_PI
@@ -25,6 +23,8 @@
 #define CG_WGS84_A 6378137.0
 #define CG_WGS84_F (1.0 / 298.257223563)
 #define CG_MAX_DEGREE 16
+#define CG_DIRECT_VELOCITY_WINDOW 9
+#define CG_DIRECT_VELOCITY_DEGREE 8
 
 typedef struct cg_fit_t {
     int degree;
@@ -246,7 +246,7 @@ static cg_time_t cg_time_from_calendar(int y, int m, int d, int hour, int minute
     return t;
 }
 
-cg_time_t cg_time_add_seconds(const cg_time_t *time_utc, double seconds)
+static cg_time_t cg_time_add_seconds(const cg_time_t *time_utc, double seconds)
 {
     double u = time_utc->unix_seconds + seconds;
     double whole_d = floor(u);
@@ -268,110 +268,6 @@ cg_time_t cg_time_add_seconds(const cg_time_t *time_utc, double seconds)
     minute = (int)((sod % 3600) / 60);
     return cg_time_from_calendar(y, (int)m, (int)d, hour, minute,
                                  (double)(sod % 60) + frac);
-}
-
-double cg_seconds_between(const cg_time_t *a, const cg_time_t *b)
-{
-    return a->unix_seconds - b->unix_seconds;
-}
-
-static char *cg_trim(char *s)
-{
-    char *end;
-    while (*s && isspace((unsigned char)*s)) {
-        ++s;
-    }
-    end = s + strlen(s);
-    while (end > s && isspace((unsigned char)end[-1])) {
-        *--end = '\0';
-    }
-    if (*s == '"' && end > s + 1 && end[-1] == '"') {
-        *--end = '\0';
-        ++s;
-    }
-    return s;
-}
-
-static int cg_month_number(const char *month)
-{
-    static const char *names[] = {
-        "jan", "feb", "mar", "apr", "may", "jun",
-        "jul", "aug", "sep", "oct", "nov", "dec"
-    };
-    char lower[4];
-    int i;
-    for (i = 0; i < 3 && month[i]; ++i) {
-        lower[i] = (char)tolower((unsigned char)month[i]);
-    }
-    lower[i] = '\0';
-    for (i = 0; i < 12; ++i) {
-        if (strcmp(lower, names[i]) == 0) {
-            return i + 1;
-        }
-    }
-    return 0;
-}
-
-int cg_parse_time(const char *text, cg_time_t *out_time)
-{
-    char buf[128];
-    char mon[16];
-    char sep = 0;
-    int y = 0, m = 0, d = 0, hh = 0, mm = 0;
-    double ss = 0.0;
-    size_t n;
-    char *s;
-
-    if (!text || !out_time) {
-        return CG_ERR_INVALID_ARGUMENT;
-    }
-
-    n = strlen(text);
-    if (n >= sizeof(buf)) {
-        return CG_ERR_PARSE;
-    }
-    memcpy(buf, text, n + 1);
-    s = cg_trim(buf);
-    n = strlen(s);
-    if (n > 0 && s[n - 1] == 'Z') {
-        s[n - 1] = '\0';
-    }
-
-    if (sscanf(s, "%d %15s %d %d:%d:%lf", &d, mon, &y, &hh, &mm, &ss) == 6) {
-        m = cg_month_number(mon);
-        if (m > 0) {
-            *out_time = cg_time_from_calendar(y, m, d, hh, mm, ss);
-            return CG_OK;
-        }
-    }
-
-    if (sscanf(s, "%d-%d-%d%c%d:%d:%lf", &y, &m, &d, &sep, &hh, &mm, &ss) == 7 &&
-        (sep == ' ' || sep == 'T')) {
-        *out_time = cg_time_from_calendar(y, m, d, hh, mm, ss);
-        return CG_OK;
-    }
-
-    if (sscanf(s, "%d/%d/%d%c%d:%d:%lf", &y, &m, &d, &sep, &hh, &mm, &ss) == 7 &&
-        (sep == ' ' || sep == 'T')) {
-        *out_time = cg_time_from_calendar(y, m, d, hh, mm, ss);
-        return CG_OK;
-    }
-
-    return CG_ERR_PARSE;
-}
-
-void cg_format_time_iso(const cg_time_t *time_utc, char *buffer, size_t buffer_size)
-{
-    double rounded_second;
-    int sec_int;
-    if (!time_utc || !buffer || buffer_size == 0) {
-        return;
-    }
-    rounded_second = floor(time_utc->second + 0.5);
-    sec_int = (int)rounded_second;
-    snprintf(buffer, buffer_size, "%04d-%02d-%02d %02d:%02d:%02d",
-             time_utc->year, time_utc->month, time_utc->day,
-             time_utc->hour, time_utc->minute, sec_int);
 }
 
 static cg_vec3_t cg_geodetic_to_ecef(double lat_deg, double lon_deg, double h_m)
@@ -780,6 +676,111 @@ static int cg_solve_linear(int n, double a[CG_MAX_DEGREE + 1][CG_MAX_DEGREE + 2]
     return CG_OK;
 }
 
+static int cg_estimate_velocity_at_index(
+    const cg_observation_t *obs,
+    size_t count,
+    size_t index,
+    cg_vec3_t *out_velocity)
+{
+    size_t first;
+    size_t last;
+    size_t nobs;
+    size_t i;
+    int degree;
+    int ncoef;
+    int j;
+    int k;
+    int coord;
+    double center_seconds;
+    double scale_seconds = 0.0;
+    double ata[CG_MAX_DEGREE + 1][CG_MAX_DEGREE + 1];
+    double rhs[3][CG_MAX_DEGREE + 1];
+
+    if (!obs || !out_velocity || index >= count || count < 2) {
+        return CG_ERR_INVALID_ARGUMENT;
+    }
+
+    first = index;
+    if (first > CG_DIRECT_VELOCITY_WINDOW / 2) {
+        first -= CG_DIRECT_VELOCITY_WINDOW / 2;
+    } else {
+        first = 0;
+    }
+    last = first + CG_DIRECT_VELOCITY_WINDOW - 1;
+    if (last >= count) {
+        last = count - 1;
+        first = last + 1 > CG_DIRECT_VELOCITY_WINDOW ? last + 1 - CG_DIRECT_VELOCITY_WINDOW : 0;
+    }
+    nobs = last - first + 1;
+    degree = (int)nobs - 1;
+    if (degree > CG_DIRECT_VELOCITY_DEGREE) {
+        degree = CG_DIRECT_VELOCITY_DEGREE;
+    }
+    if (degree < 1) {
+        return CG_ERR_FIT;
+    }
+    ncoef = degree + 1;
+    center_seconds = obs[index].time_utc.unix_seconds;
+    for (i = first; i <= last; ++i) {
+        double dt = fabs(obs[i].time_utc.unix_seconds - center_seconds);
+        if (dt > scale_seconds) {
+            scale_seconds = dt;
+        }
+    }
+    if (scale_seconds <= 0.0) {
+        return CG_ERR_FIT;
+    }
+
+    memset(ata, 0, sizeof(ata));
+    memset(rhs, 0, sizeof(rhs));
+    for (i = first; i <= last; ++i) {
+        double powers[CG_MAX_DEGREE + 1];
+        double tau = (obs[i].time_utc.unix_seconds - center_seconds) / scale_seconds;
+        cg_vec3_t r_j2000 = cg_observation_to_j2000_position(&obs[i]);
+        powers[0] = 1.0;
+        for (j = 1; j < ncoef; ++j) {
+            powers[j] = powers[j - 1] * tau;
+        }
+        for (j = 0; j < ncoef; ++j) {
+            for (k = 0; k < ncoef; ++k) {
+                ata[j][k] += powers[j] * powers[k];
+            }
+            rhs[0][j] += powers[j] * r_j2000.x;
+            rhs[1][j] += powers[j] * r_j2000.y;
+            rhs[2][j] += powers[j] * r_j2000.z;
+        }
+    }
+
+    out_velocity->x = 0.0;
+    out_velocity->y = 0.0;
+    out_velocity->z = 0.0;
+    for (coord = 0; coord < 3; ++coord) {
+        double aug[CG_MAX_DEGREE + 1][CG_MAX_DEGREE + 2];
+        double coeff[CG_MAX_DEGREE + 1];
+        int status;
+        memset(aug, 0, sizeof(aug));
+        memset(coeff, 0, sizeof(coeff));
+        for (j = 0; j < ncoef; ++j) {
+            for (k = 0; k < ncoef; ++k) {
+                aug[j][k] = ata[j][k];
+            }
+            aug[j][ncoef] = rhs[coord][j];
+        }
+        status = cg_solve_linear(ncoef, aug, coeff);
+        if (status != CG_OK) {
+            return status;
+        }
+        if (coord == 0) {
+            out_velocity->x = coeff[1] / scale_seconds;
+        } else if (coord == 1) {
+            out_velocity->y = coeff[1] / scale_seconds;
+        } else {
+            out_velocity->z = coeff[1] / scale_seconds;
+        }
+    }
+    return CG_OK;
+}
+
 static int cg_build_fit(
     const cg_observation_t *obs,
     size_t first,
@@ -1009,10 +1010,21 @@ static int cg_direct_state_at_index(
     cg_fit_cache_t *cache,
     cg_state_t *out)
 {
+    int status;
     if (index >= count) {
         return CG_ERR_INVALID_ARGUMENT;
     }
-    return cg_interpolate_state_cached(obs, count, &obs[index].time_utc, opt, cache, out);
+    out->time_utc = obs[index].time_utc;
+    out->r_j2000_m = cg_observation_to_j2000_position(&obs[index]);
+    status = cg_estimate_velocity_at_index(obs, count, index, &out->v_j2000_mps);
+    if (status == CG_OK) {
+        return CG_OK;
+    }
+    status = cg_interpolate_state_cached(obs, count, &obs[index].time_utc, opt, cache, out);
+    if (status == CG_OK) {
+        out->r_j2000_m = cg_observation_to_j2000_position(&obs[index]);
+    }
+    return status;
 }
 
 static size_t cg_find_nearest_observation(const cg_observation_t *obs, size_t count, double unix_seconds)
