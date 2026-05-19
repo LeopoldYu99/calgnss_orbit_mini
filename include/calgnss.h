@@ -71,8 +71,6 @@ void cg_format_time_iso(const cg_time_t *time_utc, char *buffer, size_t buffer_s
 double cg_seconds_between(const cg_time_t *a, const cg_time_t *b);
 cg_time_t cg_time_add_seconds(const cg_time_t *time_utc, double seconds);
 
-int cg_load_lla_csv(const char *path, cg_observation_t **out_observations, size_t *out_count);
-void cg_free_observations(cg_observation_t *observations);
 int cg_precompute_observations(cg_observation_t *observations, size_t count);
 
 int cg_query_state(
@@ -81,14 +79,6 @@ int cg_query_state(
     const cg_time_t *query_time_utc,
     const cg_options_t *options,
     cg_state_t *out_state);
-
-int cg_export_j2000_csv(
-    const char *input_lla_csv,
-    const char *output_j2000_csv,
-    const cg_time_t *start_time_utc,
-    const cg_time_t *end_time_utc,
-    double step_seconds,
-    const cg_options_t *options);
 
 const char *cg_status_string(int status);
 

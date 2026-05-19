@@ -1,12 +1,10 @@
 #include "calgnss.h"
 
 #include <ctype.h>
-#include <errno.h>
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #ifndef CG_PI
@@ -27,8 +25,6 @@
 #define CG_WGS84_A 6378137.0
 #define CG_WGS84_F (1.0 / 298.257223563)
 #define CG_MAX_DEGREE 16
-#define CG_LINE_BUFFER 2048
-#define CG_MAX_FIELDS 32
 
 typedef struct cg_fit_t {
     int degree;
@@ -378,67 +374,6 @@ void cg_format_time_iso(const cg_time_t *time_utc, char *buffer, size_t buffer_s
              time_utc->hour, time_utc->minute, sec_int);
 }
 
-static int cg_split_csv_line(char *line, char **fields, int max_fields)
-{
-    int count = 0;
-    int in_quotes = 0;
-    char *p = line;
-    char *start = line;
-    while (*p) {
-        if (*p == '"') {
-            in_quotes = !in_quotes;
-        } else if (*p == ',' && !in_quotes) {
-            *p = '\0';
-            if (count < max_fields) {
-                fields[count++] = cg_trim(start);
-            }
-            start = p + 1;
-        } else if (*p == '\r' || *p == '\n') {
-            *p = '\0';
-            break;
-        }
-        ++p;
-    }
-    if (count < max_fields) {
-        fields[count++] = cg_trim(start);
-    }
-    return count;
-}
-
-static int cg_field_equals(const char *a, const char *b)
-{
-    while (*a && *b) {
-        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
-            return 0;
-        }
-        ++a;
-        ++b;
-    }
-    return *a == '\0' && *b == '\0';
-}
-
-static int cg_find_field(char **fields, int count, const char *name)
-{
-    int i;
-    for (i = 0; i < count; ++i) {
-        if (cg_field_equals(fields[i], name)) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-static int cg_find_field_contains(char **fields, int count, const char *needle)
-{
-    int i;
-    for (i = 0; i < count; ++i) {
-        if (strstr(fields[i], needle) != NULL) {
-            return i;
-        }
-    }
-    return -1;
-}
-
 static cg_vec3_t cg_geodetic_to_ecef(double lat_deg, double lon_deg, double h_m)
 {
     const double e2 = CG_WGS84_F * (2.0 - CG_WGS84_F);
@@ -732,145 +667,6 @@ static void cg_ecef_to_j2000(
     v_total = cg_vec_add(v_ecef, spin);
     *r_j2000 = cg_mat_vec(m, r_ecef);
     *v_j2000 = cg_mat_vec(m, v_total);
-}
-
-static int cg_compare_observations(const void *a, const void *b)
-{
-    const cg_observation_t *oa = (const cg_observation_t *)a;
-    const cg_observation_t *ob = (const cg_observation_t *)b;
-    if (oa->time_utc.unix_seconds < ob->time_utc.unix_seconds) {
-        return -1;
-    }
-    if (oa->time_utc.unix_seconds > ob->time_utc.unix_seconds) {
-        return 1;
-    }
-    return 0;
-}
-
-int cg_load_lla_csv(const char *path, cg_observation_t **out_observations, size_t *out_count)
-{
-    FILE *f;
-    char line[CG_LINE_BUFFER];
-    char normalized_header[CG_LINE_BUFFER];
-    char *fields[CG_MAX_FIELDS];
-    int field_count;
-    int time_col;
-    int lat_col;
-    int lon_col;
-    int alt_col;
-    int lat_rate_col;
-    int lon_rate_col;
-    int alt_rate_col;
-    int alt_is_km;
-    cg_observation_t *obs = NULL;
-    size_t count = 0;
-    size_t capacity = 0;
-
-    if (!path || !out_observations || !out_count) {
-        return CG_ERR_INVALID_ARGUMENT;
-    }
-    *out_observations = NULL;
-    *out_count = 0;
-
-    f = fopen(path, "rb");
-    if (!f) {
-        return CG_ERR_IO;
-    }
-    if (!fgets(line, sizeof(line), f)) {
-        fclose(f);
-        return CG_ERR_PARSE;
-    }
-    {
-        size_t si = 0;
-        size_t di = 0;
-        if ((unsigned char)line[0] == 0xEF &&
-            (unsigned char)line[1] == 0xBB &&
-            (unsigned char)line[2] == 0xBF) {
-            si = 3;
-        }
-        while (line[si] && di + 1 < sizeof(normalized_header)) {
-            if (line[si] != '"') {
-                normalized_header[di++] = line[si];
-            }
-            ++si;
-        }
-        normalized_header[di] = '\0';
-    }
-    field_count = cg_split_csv_line(normalized_header, fields, CG_MAX_FIELDS);
-    time_col = cg_find_field(fields, field_count, "Time (UTCG)");
-    lat_col = cg_find_field(fields, field_count, "Lat (deg)");
-    lon_col = cg_find_field(fields, field_count, "Lon (deg)");
-    alt_col = cg_find_field(fields, field_count, "Alt (km)");
-    if (alt_col < 0) {
-        alt_col = cg_find_field_contains(fields, field_count, "Alt");
-    }
-    lat_rate_col = cg_find_field(fields, field_count, "Lat Rate (deg/sec)");
-    lon_rate_col = cg_find_field(fields, field_count, "Lon Rate (deg/sec)");
-    alt_rate_col = cg_find_field(fields, field_count, "Alt Rate (km/sec)");
-    if (time_col < 0 || lat_col < 0 || lon_col < 0 || alt_col < 0) {
-        fclose(f);
-        return CG_ERR_PARSE;
-    }
-    alt_is_km = strstr(fields[alt_col], "(km)") != NULL || strstr(fields[alt_col], "(KM)") != NULL;
-
-    while (fgets(line, sizeof(line), f)) {
-        cg_observation_t item;
-        char *endptr;
-        double alt_value;
-        field_count = cg_split_csv_line(line, fields, CG_MAX_FIELDS);
-        if (field_count <= alt_col) {
-            continue;
-        }
-        memset(&item, 0, sizeof(item));
-        if (cg_parse_time(fields[time_col], &item.time_utc) != CG_OK) {
-            free(obs);
-            fclose(f);
-            return CG_ERR_PARSE;
-        }
-        errno = 0;
-        item.lat_deg = strtod(fields[lat_col], &endptr);
-        if (errno || endptr == fields[lat_col]) {
-            free(obs);
-            fclose(f);
-            return CG_ERR_PARSE;
-        }
-        item.lon_deg = strtod(fields[lon_col], &endptr);
-        alt_value = strtod(fields[alt_col], &endptr);
-        item.alt_m = alt_is_km ? alt_value * 1000.0 : alt_value;
-        item.has_rates = lat_rate_col >= 0 && lon_rate_col >= 0 && alt_rate_col >= 0 &&
-                         field_count > lat_rate_col && field_count > lon_rate_col && field_count > alt_rate_col;
-        if (item.has_rates) {
-            item.lat_rate_degps = strtod(fields[lat_rate_col], NULL);
-            item.lon_rate_degps = strtod(fields[lon_rate_col], NULL);
-            item.alt_rate_mps = strtod(fields[alt_rate_col], NULL) * 1000.0;
-        }
-        if (count == capacity) {
-            size_t new_capacity = capacity == 0 ? 128 : capacity * 2;
-            cg_observation_t *new_obs = (cg_observation_t *)realloc(obs, new_capacity * sizeof(*obs));
-            if (!new_obs) {
-                free(obs);
-                fclose(f);
-                return CG_ERR_NO_MEMORY;
-            }
-            obs = new_obs;
-            capacity = new_capacity;
-        }
-        obs[count++] = item;
-    }
-    fclose(f);
-    if (count < 2) {
-        free(obs);
-        return CG_ERR_PARSE;
-    }
-    qsort(obs, count, sizeof(*obs), cg_compare_observations);
-    *out_observations = obs;
-    *out_count = count;
-    return CG_OK;
-}
-
-void cg_free_observations(cg_observation_t *observations)
-{
-    free(observations);
 }
 
 int cg_precompute_observations(cg_observation_t *observations, size_t count)
@@ -1415,74 +1211,6 @@ int cg_query_state(
     memset(&aux_cache, 0, sizeof(aux_cache));
     return cg_query_state_internal(observations, count, query_time_utc, &default_options,
                                    &main_cache, &aux_cache, out_state);
-}
-
-int cg_export_j2000_csv(
-    const char *input_lla_csv,
-    const char *output_j2000_csv,
-    const cg_time_t *start_time_utc,
-    const cg_time_t *end_time_utc,
-    double step_seconds,
-    const cg_options_t *options)
-{
-    cg_observation_t *obs = NULL;
-    size_t count = 0;
-    cg_options_t opt;
-    cg_time_t start;
-    cg_time_t end;
-    cg_time_t current;
-    FILE *out;
-    int status;
-    cg_fit_cache_t main_cache;
-    cg_fit_cache_t aux_cache;
-
-    if (!input_lla_csv || !output_j2000_csv || step_seconds <= 0.0) {
-        return CG_ERR_INVALID_ARGUMENT;
-    }
-    opt = options ? *options : cg_default_options();
-    status = cg_load_lla_csv(input_lla_csv, &obs, &count);
-    if (status != CG_OK) {
-        return status;
-    }
-    status = cg_precompute_observations(obs, count);
-    if (status != CG_OK) {
-        cg_free_observations(obs);
-        return status;
-    }
-    start = start_time_utc ? *start_time_utc : obs[0].time_utc;
-    end = end_time_utc ? *end_time_utc : obs[count - 1].time_utc;
-    out = fopen(output_j2000_csv, "wb");
-    if (!out) {
-        cg_free_observations(obs);
-        return CG_ERR_IO;
-    }
-    fprintf(out, "\"Time (UTCG)\",\"x (km)\",\"y (km)\",\"z (km)\",\"vx (km/sec)\",\"vy (km/sec)\",\"vz (km/sec)\"\n");
-    memset(&main_cache, 0, sizeof(main_cache));
-    memset(&aux_cache, 0, sizeof(aux_cache));
-    current = start;
-    while (current.unix_seconds <= end.unix_seconds + 1.0e-9) {
-        cg_state_t state;
-        char time_text[64];
-        status = cg_query_state_internal(obs, count, &current, &opt, &main_cache, &aux_cache, &state);
-        if (status != CG_OK) {
-            fclose(out);
-            cg_free_observations(obs);
-            return status;
-        }
-        cg_format_time_iso(&current, time_text, sizeof(time_text));
-        fprintf(out, "%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-                time_text,
-                state.r_j2000_m.x / 1000.0,
-                state.r_j2000_m.y / 1000.0,
-                state.r_j2000_m.z / 1000.0,
-                state.v_j2000_mps.x / 1000.0,
-                state.v_j2000_mps.y / 1000.0,
-                state.v_j2000_mps.z / 1000.0);
-        current = cg_time_add_seconds(&current, step_seconds);
-    }
-    fclose(out);
-    cg_free_observations(obs);
-    return CG_OK;
 }
 
 const char *cg_status_string(int status)
