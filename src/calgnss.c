@@ -391,39 +391,6 @@ static cg_vec3_t cg_geodetic_to_ecef(double lat_deg, double lon_deg, double h_m)
     return r;
 }
 
-static cg_vec3_t cg_geodetic_rates_to_ecef_velocity(
-    double lat_deg,
-    double lon_deg,
-    double h_m,
-    double lat_rate_degps,
-    double lon_rate_degps,
-    double h_rate_mps)
-{
-    const double e2 = CG_WGS84_F * (2.0 - CG_WGS84_F);
-    double lat = lat_deg * CG_DEG2RAD;
-    double lon = lon_deg * CG_DEG2RAD;
-    double lat_rate = lat_rate_degps * CG_DEG2RAD;
-    double lon_rate = lon_rate_degps * CG_DEG2RAD;
-    double sin_lat = sin(lat);
-    double cos_lat = cos(lat);
-    double sin_lon = sin(lon);
-    double cos_lon = cos(lon);
-    double denom = 1.0 - e2 * sin_lat * sin_lat;
-    double n = CG_WGS84_A / sqrt(denom);
-    double dn_dlat = CG_WGS84_A * e2 * sin_lat * cos_lat / pow(denom, 1.5);
-    double common_lat = dn_dlat * cos_lat - (n + h_m) * sin_lat;
-    cg_vec3_t v;
-    v.x = (common_lat * cos_lon) * lat_rate +
-          (-(n + h_m) * cos_lat * sin_lon) * lon_rate +
-          (cos_lat * cos_lon) * h_rate_mps;
-    v.y = (common_lat * sin_lon) * lat_rate +
-          ((n + h_m) * cos_lat * cos_lon) * lon_rate +
-          (cos_lat * sin_lon) * h_rate_mps;
-    v.z = (dn_dlat * (1.0 - e2) * sin_lat + (n * (1.0 - e2) + h_m) * cos_lat) * lat_rate +
-          sin_lat * h_rate_mps;
-    return v;
-}
-
 typedef struct cg_nut_term_t {
     int nl;
     int nlp;
@@ -669,33 +636,28 @@ static void cg_ecef_to_j2000(
     *v_j2000 = cg_mat_vec(m, v_total);
 }
 
+static cg_vec3_t cg_observation_to_j2000_position(const cg_observation_t *observation)
+{
+    cg_vec3_t zero;
+    cg_vec3_t r_ecef;
+    cg_vec3_t r_j2000;
+    cg_vec3_t ignored_v_j2000;
+    zero.x = zero.y = zero.z = 0.0;
+    r_ecef = cg_geodetic_to_ecef(
+        observation->lat_deg, observation->lon_deg, observation->alt_m);
+    cg_ecef_to_j2000(
+        &observation->time_utc,
+        r_ecef,
+        zero,
+        &r_j2000,
+        &ignored_v_j2000);
+    return r_j2000;
+}
+
 int cg_precompute_observations(cg_observation_t *observations, size_t count)
 {
-    size_t i;
     if (!observations || count < 2) {
         return CG_ERR_INVALID_ARGUMENT;
-    }
-    for (i = 0; i < count; ++i) {
-        cg_vec3_t zero;
-        zero.x = zero.y = zero.z = 0.0;
-        observations[i].r_ecef_m = cg_geodetic_to_ecef(
-            observations[i].lat_deg, observations[i].lon_deg, observations[i].alt_m);
-        observations[i].v_ecef_mps = zero;
-        if (observations[i].has_rates) {
-            observations[i].v_ecef_mps = cg_geodetic_rates_to_ecef_velocity(
-                observations[i].lat_deg,
-                observations[i].lon_deg,
-                observations[i].alt_m,
-                observations[i].lat_rate_degps,
-                observations[i].lon_rate_degps,
-                observations[i].alt_rate_mps);
-        }
-        cg_ecef_to_j2000(
-            &observations[i].time_utc,
-            observations[i].r_ecef_m,
-            observations[i].v_ecef_mps,
-            &observations[i].r_j2000_m,
-            &observations[i].v_j2000_mps);
     }
     return CG_OK;
 }
@@ -867,14 +829,15 @@ static int cg_build_fit(
     }
     for (i = first; i <= last; ++i) {
         double tau = (obs[i].time_utc.unix_seconds - fit->epoch_seconds) / fit->scale_seconds;
+        cg_vec3_t r_j2000 = cg_observation_to_j2000_position(&obs[i]);
         cg_cheb_basis(tau, degree, basis);
         for (j = 0; j < ncoef; ++j) {
             for (k = 0; k < ncoef; ++k) {
                 ata[j][k] += basis[j] * basis[k];
             }
-            rhs[0][j] += basis[j] * obs[i].r_j2000_m.x;
-            rhs[1][j] += basis[j] * obs[i].r_j2000_m.y;
-            rhs[2][j] += basis[j] * obs[i].r_j2000_m.z;
+            rhs[0][j] += basis[j] * r_j2000.x;
+            rhs[1][j] += basis[j] * r_j2000.y;
+            rhs[2][j] += basis[j] * r_j2000.z;
         }
     }
     for (coord = 0; coord < 3; ++coord) {
@@ -1048,12 +1011,6 @@ static int cg_direct_state_at_index(
 {
     if (index >= count) {
         return CG_ERR_INVALID_ARGUMENT;
-    }
-    out->time_utc = obs[index].time_utc;
-    out->r_j2000_m = obs[index].r_j2000_m;
-    if (obs[index].has_rates) {
-        out->v_j2000_mps = obs[index].v_j2000_mps;
-        return CG_OK;
     }
     return cg_interpolate_state_cached(obs, count, &obs[index].time_utc, opt, cache, out);
 }

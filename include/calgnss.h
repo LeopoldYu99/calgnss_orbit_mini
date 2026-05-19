@@ -35,14 +35,6 @@ typedef struct cg_observation_t {
     double lat_deg;
     double lon_deg;
     double alt_m;
-    int has_rates;
-    double lat_rate_degps;
-    double lon_rate_degps;
-    double alt_rate_mps;
-    cg_vec3_t r_ecef_m;
-    cg_vec3_t v_ecef_mps;
-    cg_vec3_t r_j2000_m;
-    cg_vec3_t v_j2000_mps;
 } cg_observation_t;
 
 typedef struct cg_options_t {

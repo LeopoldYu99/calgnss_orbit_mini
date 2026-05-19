@@ -9,8 +9,8 @@
 #define CSV_LINE_BUFFER 2048
 #define CSV_MAX_FIELDS 32
 
-static const char *k_input_csv = "..\\20260518\\67217_LLA_Position_2hour.csv";
-static const char *k_output_csv = "..\\20260518\\67217_J2000_Calculated.csv";
+static const char *k_input_csv = "..\\20260518\\67113_LLA_Position_2hour.csv";
+static const char *k_output_csv = "..\\20260518\\67113_J2000_Calculated.csv";
 static const char *k_start_time_text = "18 May 2026 04:00:00.000";
 static const char *k_end_time_text = "18 May 2026 06:59:59.000";
 static const double k_step_seconds = 1.0;
@@ -117,9 +117,6 @@ static int load_lla_csv(const char *path, cg_observation_t **out_observations, s
     int lat_col;
     int lon_col;
     int alt_col;
-    int lat_rate_col;
-    int lon_rate_col;
-    int alt_rate_col;
     int alt_is_km;
     cg_observation_t *observations = NULL;
     size_t count = 0;
@@ -163,9 +160,6 @@ static int load_lla_csv(const char *path, cg_observation_t **out_observations, s
     if (alt_col < 0) {
         alt_col = csv_find_field_contains(fields, field_count, "Alt");
     }
-    lat_rate_col = csv_find_field(fields, field_count, "Lat Rate (deg/sec)");
-    lon_rate_col = csv_find_field(fields, field_count, "Lon Rate (deg/sec)");
-    alt_rate_col = csv_find_field(fields, field_count, "Alt Rate (km/sec)");
     if (time_col < 0 || lat_col < 0 || lon_col < 0 || alt_col < 0) {
         fclose(f);
         return CG_ERR_PARSE;
@@ -196,13 +190,6 @@ static int load_lla_csv(const char *path, cg_observation_t **out_observations, s
         item.lon_deg = strtod(fields[lon_col], &endptr);
         alt_value = strtod(fields[alt_col], &endptr);
         item.alt_m = alt_is_km ? alt_value * 1000.0 : alt_value;
-        item.has_rates = lat_rate_col >= 0 && lon_rate_col >= 0 && alt_rate_col >= 0 &&
-                         field_count > lat_rate_col && field_count > lon_rate_col && field_count > alt_rate_col;
-        if (item.has_rates) {
-            item.lat_rate_degps = strtod(fields[lat_rate_col], NULL);
-            item.lon_rate_degps = strtod(fields[lon_rate_col], NULL);
-            item.alt_rate_mps = strtod(fields[alt_rate_col], NULL) * 1000.0;
-        }
         if (count == capacity) {
             size_t new_capacity = capacity == 0 ? 128 : capacity * 2;
             cg_observation_t *new_observations =
