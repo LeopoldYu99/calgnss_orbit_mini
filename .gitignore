@@ -8,3 +8,4 @@ build/
 *.pdb
 *.obj
 *.ilk
+/.vs/cmake.db
