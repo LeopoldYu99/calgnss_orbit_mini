@@ -11,10 +11,10 @@
 #define CSV_LINE_BUFFER 2048
 #define CSV_MAX_FIELDS 32
 
-static const char *k_input_csv = "..\\20260518\\67217_LLA_Position_2hour.csv";
-static const char *k_output_csv = "..\\20260518\\67217_J2000_Calculated.csv";
-static const char *k_start_time_text = "18 May 2026 04:00:00.000";
-static const char *k_end_time_text = "18 May 2026 06:59:59.000";
+static const char *k_input_csv = "E:\\JC\\GNSS_OrbitDetermination\\DAT1\\ReceivedTofile-UDP-2026_5_18_14-39-28_LLA.csv";
+static const char *k_output_csv = "E:\\JC\\GNSS_OrbitDetermination\\DAT1\\ReceivedTofile-UDP-2026_5_18_14-39-28_J2000_Calculated.csv";
+static const char *k_start_time_text = "18 May 2026 07:25:00.000";
+static const char *k_end_time_text = "18 May 2026 09:35:00.000";
 static const double k_step_seconds = 1.0;
 
 static char *csv_trim(char *s)
