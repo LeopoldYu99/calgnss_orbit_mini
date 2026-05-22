@@ -9,3 +9,4 @@ build/
 *.obj
 *.ilk
 /.vs/cmake.db
+/.vs
