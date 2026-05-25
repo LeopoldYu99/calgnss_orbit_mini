@@ -25,6 +25,7 @@
 #define CG_WGS84_F (1.0 / 298.257223563)
 #define CG_DIRECT_VELOCITY_WINDOW 9
 #define CG_DIRECT_VELOCITY_DEGREE 8
+#define CG_FIT_WINDOW_MINUTES 60.0
 #define CG_DYNAMIC_FIT_MIN_OBSERVATIONS 6
 #define CG_DYNAMIC_FIT_ITERATIONS 4
 #define CG_DYNAMIC_FIT_POSITION_SCALE_M 100.0
@@ -581,7 +582,6 @@ cg_options_t cg_default_options(void)
 {
     cg_options_t opt;
     opt.degree = 10;
-    opt.fit_window_minutes = 60.0;
     opt.max_extrapolation_seconds = 0.0;
     opt.extrapolation_history_seconds = 7200.0;
     opt.propagation_step_seconds = 10.0;
@@ -593,20 +593,14 @@ static void cg_select_window(
     const cg_observation_t *obs,
     size_t count,
     const cg_time_t *query,
-    const cg_options_t *opt,
     size_t *first,
     size_t *last)
 {
-    double half_window = opt->fit_window_minutes * 30.0;
+    double half_window = CG_FIT_WINDOW_MINUTES * 30.0;
     double q = query->unix_seconds;
     size_t i;
     size_t f = 0;
     size_t l = count - 1;
-    if (opt->fit_window_minutes <= 0.0) {
-        *first = 0;
-        *last = count - 1;
-        return;
-    }
     while (f < count && obs[f].time_utc.unix_seconds < q - half_window) {
         ++f;
     }
@@ -942,7 +936,7 @@ static int cg_interpolate_state_cached(
     size_t last;
     int degree = opt->degree;
     int status;
-    cg_select_window(obs, count, query, opt, &first, &last);
+    cg_select_window(obs, count, query, &first, &last);
     if (!cache || !cache->valid || cache->first_index != first || cache->last_index != last || cache->degree != degree) {
         cg_fit_t fit;
         status = cg_build_fit(obs, first, last, degree, &fit);

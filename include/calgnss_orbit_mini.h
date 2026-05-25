@@ -39,7 +39,6 @@ typedef struct cg_observation_t {
 
 typedef struct cg_options_t {
     int degree;
-    double fit_window_minutes;
     /* <= 0 means no fixed future extrapolation limit. */
     double max_extrapolation_seconds;
     /* <= 0 means use all cached history for future extrapolation initial-state fitting. */

@@ -1,12 +1,12 @@
+build/
+out/
 x64/
 Win32/
-CalGNSSC/
-calgnss_orbit_mini/
-build/
+.vs/
 *.user
 *.suo
 *.pdb
 *.obj
 *.ilk
-/.vs/cmake.db
-/.vs
+*.lib
+*.exe
