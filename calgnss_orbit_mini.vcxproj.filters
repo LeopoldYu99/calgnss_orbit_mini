@@ -9,12 +9,12 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="include\calgnss.h">
+    <ClInclude Include="include\calgnss_orbit_mini.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="src\calgnss.c">
+    <ClCompile Include="src\calgnss_orbit_mini.c">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

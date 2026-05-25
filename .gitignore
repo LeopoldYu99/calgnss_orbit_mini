@@ -1,7 +1,7 @@
 x64/
 Win32/
 CalGNSSC/
-calgnss/
+calgnss_orbit_mini/
 build/
 *.user
 *.suo

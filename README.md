@@ -5,7 +5,7 @@ Pure C GNSS LLA to J2000 state fitting and short-term prediction project.
 ## Build
 
 Open `CalGNSSC.sln` in Visual Studio and build `Release|x64`. The solution now
-contains a standalone `calgnss` static library project plus a `CalGNSSC`
+contains a standalone `calgnss_orbit_mini` static library project plus a `CalGNSSC`
 console test entry that references the library. Or use CMake on other
 platforms:
 
@@ -15,8 +15,25 @@ cmake --build build --config Release
 ```
 
 The core code uses only the C standard library and `math.h`. The Visual Studio
-project is only a build wrapper; the same `include/calgnss.h` and
-`src/calgnss.c` can be reused in Linux or RTOS builds.
+project is only a build wrapper; the same `include/calgnss_orbit_mini.h` and
+`src/calgnss_orbit_mini.c` can be reused in Linux or RTOS builds.
+
+## C API
+
+`cg_context_t` is opaque. Create it through `cg_context_create`, feed ordered
+LLA observations with `cg_context_push`, query J2000 position/velocity with
+`cg_context_query_state`, and release it with `cg_context_destroy`.
+
+```c
+cg_observation_t buffer[CG_DEFAULT_OBSERVATION_CAPACITY];
+cg_context_t *context = NULL;
+cg_state_t state;
+
+status = cg_context_create(&context, buffer, CG_DEFAULT_OBSERVATION_CAPACITY, &options);
+status = cg_context_push(context, &observation);
+status = cg_context_query_state(context, &query_time, &state);
+cg_context_destroy(context);
+```
 
 ## Default Test Entry
 

@@ -1,8 +1,9 @@
-#include "calgnss.h"
+#include "calgnss_orbit_mini.h"
 
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifndef CG_PI
@@ -22,9 +23,12 @@
 #define CG_J2_EARTH 1.08262668e-3
 #define CG_WGS84_A 6378137.0
 #define CG_WGS84_F (1.0 / 298.257223563)
-#define CG_MAX_DEGREE 16
 #define CG_DIRECT_VELOCITY_WINDOW 9
 #define CG_DIRECT_VELOCITY_DEGREE 8
+#define CG_DYNAMIC_FIT_MIN_OBSERVATIONS 6
+#define CG_DYNAMIC_FIT_ITERATIONS 4
+#define CG_DYNAMIC_FIT_POSITION_SCALE_M 100.0
+#define CG_DYNAMIC_FIT_VELOCITY_SCALE_MPS 0.1
 
 typedef struct cg_fit_t {
     int degree;
@@ -37,11 +41,26 @@ typedef struct cg_fit_t {
 
 typedef struct cg_fit_cache_t {
     int valid;
+    int dynamic_valid;
     int degree;
     size_t first_index;
     size_t last_index;
+    size_t dynamic_first_index;
+    size_t dynamic_last_index;
+    double extrapolation_history_seconds;
     cg_fit_t fit;
+    cg_state_t dynamic_state;
 } cg_fit_cache_t;
+
+struct cg_context_t {
+    cg_observation_t *observations;
+    size_t capacity;
+    size_t count;
+    size_t start;
+    cg_options_t options;
+    cg_fit_cache_t main_cache;
+    cg_fit_cache_t aux_cache;
+};
 
 static double cg_vec_dot(cg_vec3_t a, cg_vec3_t b)
 {
@@ -564,6 +583,7 @@ cg_options_t cg_default_options(void)
     opt.degree = 10;
     opt.fit_window_minutes = 60.0;
     opt.max_extrapolation_seconds = 0.0;
+    opt.extrapolation_history_seconds = 7200.0;
     opt.propagation_step_seconds = 10.0;
     opt.enable_orbit_phase_correction = 1;
     return opt;
@@ -944,6 +964,63 @@ static int cg_interpolate_state_cached(
     return CG_OK;
 }
 
+static void cg_select_extrapolation_fit_window(
+    const cg_observation_t *obs,
+    size_t count,
+    const cg_options_t *opt,
+    size_t *first,
+    size_t *last)
+{
+    size_t f = 0;
+    size_t l = count - 1;
+    if (opt->extrapolation_history_seconds > 0.0) {
+        double earliest = obs[l].time_utc.unix_seconds - opt->extrapolation_history_seconds;
+        while (f < l && obs[f].time_utc.unix_seconds < earliest) {
+            ++f;
+        }
+        if (f >= l && l > 0) {
+            f = l - 1;
+        }
+    }
+    *first = f;
+    *last = l;
+}
+
+static int cg_fit_state_at_index_cached(
+    const cg_observation_t *obs,
+    size_t count,
+    size_t index,
+    size_t first,
+    size_t last,
+    int degree,
+    cg_fit_cache_t *cache,
+    cg_state_t *out)
+{
+    int status;
+    if (!obs || !out || index >= count || last >= count || last < first || index < first || index > last) {
+        return CG_ERR_INVALID_ARGUMENT;
+    }
+    if (!cache || !cache->valid || cache->first_index != first || cache->last_index != last || cache->degree != degree) {
+        cg_fit_t fit;
+        status = cg_build_fit(obs, first, last, degree, &fit);
+        if (status != CG_OK) {
+            return status;
+        }
+        if (cache) {
+            cache->valid = 1;
+            cache->degree = degree;
+            cache->first_index = first;
+            cache->last_index = last;
+            cache->fit = fit;
+        } else {
+            cg_fit_eval(&fit, &obs[index].time_utc, out);
+            return CG_OK;
+        }
+    }
+    cg_fit_eval(&cache->fit, &obs[index].time_utc, out);
+    return CG_OK;
+}
+
 static cg_vec3_t cg_j2_acceleration(cg_vec3_t r)
 {
     double radius = cg_vec_norm(r);
@@ -1002,6 +1079,128 @@ static int cg_propagate_j2(cg_vec3_t r0, cg_vec3_t v0, double dt, double step_se
     return CG_OK;
 }
 
+static int cg_dynamic_fit_state(
+    const cg_observation_t *obs,
+    size_t first,
+    size_t last,
+    const cg_options_t *opt,
+    cg_state_t *state)
+{
+    static const double scale[6] = {
+        CG_DYNAMIC_FIT_POSITION_SCALE_M,
+        CG_DYNAMIC_FIT_POSITION_SCALE_M,
+        CG_DYNAMIC_FIT_POSITION_SCALE_M,
+        CG_DYNAMIC_FIT_VELOCITY_SCALE_MPS,
+        CG_DYNAMIC_FIT_VELOCITY_SCALE_MPS,
+        CG_DYNAMIC_FIT_VELOCITY_SCALE_MPS
+    };
+    double x[6];
+    int iter;
+    if (!obs || !opt || !state || last < first ||
+        last - first + 1 < CG_DYNAMIC_FIT_MIN_OBSERVATIONS) {
+        return CG_ERR_INVALID_ARGUMENT;
+    }
+
+    x[0] = state->r_j2000_m.x;
+    x[1] = state->r_j2000_m.y;
+    x[2] = state->r_j2000_m.z;
+    x[3] = state->v_j2000_mps.x;
+    x[4] = state->v_j2000_mps.y;
+    x[5] = state->v_j2000_mps.z;
+
+    for (iter = 0; iter < CG_DYNAMIC_FIT_ITERATIONS; ++iter) {
+        double normal[CG_MAX_DEGREE + 1][CG_MAX_DEGREE + 2];
+        double delta_scaled[CG_MAX_DEGREE + 1];
+        double max_diag = 0.0;
+        size_t i;
+        int row;
+        int col;
+        int status;
+        memset(normal, 0, sizeof(normal));
+        memset(delta_scaled, 0, sizeof(delta_scaled));
+
+        for (i = first; i <= last; ++i) {
+            double dt = obs[i].time_utc.unix_seconds - obs[last].time_utc.unix_seconds;
+            cg_vec3_t observed = cg_observation_to_j2000_position(&obs[i]);
+            cg_vec3_t base_r;
+            cg_vec3_t base_v;
+            double residual[3];
+            double jac[3][6];
+
+            status = cg_propagate_j2((cg_vec3_t){x[0], x[1], x[2]},
+                                     (cg_vec3_t){x[3], x[4], x[5]},
+                                     dt, opt->propagation_step_seconds,
+                                     &base_r, &base_v);
+            if (status != CG_OK) {
+                return status;
+            }
+            residual[0] = base_r.x - observed.x;
+            residual[1] = base_r.y - observed.y;
+            residual[2] = base_r.z - observed.z;
+
+            for (col = 0; col < 6; ++col) {
+                double xp[6];
+                cg_vec3_t pert_r;
+                cg_vec3_t pert_v;
+                memcpy(xp, x, sizeof(xp));
+                xp[col] += scale[col];
+                status = cg_propagate_j2((cg_vec3_t){xp[0], xp[1], xp[2]},
+                                         (cg_vec3_t){xp[3], xp[4], xp[5]},
+                                         dt, opt->propagation_step_seconds,
+                                         &pert_r, &pert_v);
+                if (status != CG_OK) {
+                    return status;
+                }
+                jac[0][col] = pert_r.x - base_r.x;
+                jac[1][col] = pert_r.y - base_r.y;
+                jac[2][col] = pert_r.z - base_r.z;
+            }
+
+            for (row = 0; row < 6; ++row) {
+                for (col = 0; col < 6; ++col) {
+                    normal[row][col] += jac[0][row] * jac[0][col] +
+                                        jac[1][row] * jac[1][col] +
+                                        jac[2][row] * jac[2][col];
+                }
+                normal[row][6] -= jac[0][row] * residual[0] +
+                                  jac[1][row] * residual[1] +
+                                  jac[2][row] * residual[2];
+            }
+        }
+
+        for (row = 0; row < 6; ++row) {
+            double d = fabs(normal[row][row]);
+            if (d > max_diag) {
+                max_diag = d;
+            }
+        }
+        if (max_diag <= 0.0) {
+            return CG_ERR_FIT;
+        }
+        for (row = 0; row < 6; ++row) {
+            normal[row][row] += max_diag * 1.0e-10;
+        }
+
+        status = cg_solve_linear(6, normal, delta_scaled);
+        if (status != CG_OK) {
+            return status;
+        }
+
+        for (row = 0; row < 6; ++row) {
+            x[row] += delta_scaled[row] * scale[row];
+        }
+    }
+
+    state->time_utc = obs[last].time_utc;
+    state->r_j2000_m.x = x[0];
+    state->r_j2000_m.y = x[1];
+    state->r_j2000_m.z = x[2];
+    state->v_j2000_mps.x = x[3];
+    state->v_j2000_mps.y = x[4];
+    state->v_j2000_mps.z = x[5];
+    return CG_OK;
+}
+
 static int cg_direct_state_at_index(
     const cg_observation_t *obs,
     size_t count,
@@ -1016,15 +1215,58 @@ static int cg_direct_state_at_index(
     }
     out->time_utc = obs[index].time_utc;
     out->r_j2000_m = cg_observation_to_j2000_position(&obs[index]);
+    status = cg_interpolate_state_cached(obs, count, &obs[index].time_utc, opt, cache, out);
+    if (status == CG_OK) {
+        out->r_j2000_m = cg_observation_to_j2000_position(&obs[index]);
+        return CG_OK;
+    }
+    out->time_utc = obs[index].time_utc;
+    out->r_j2000_m = cg_observation_to_j2000_position(&obs[index]);
     status = cg_estimate_velocity_at_index(obs, count, index, &out->v_j2000_mps);
     if (status == CG_OK) {
         return CG_OK;
     }
-    status = cg_interpolate_state_cached(obs, count, &obs[index].time_utc, opt, cache, out);
-    if (status == CG_OK) {
-        out->r_j2000_m = cg_observation_to_j2000_position(&obs[index]);
-    }
     return status;
+}
+
+static int cg_extrapolation_initial_state(
+    const cg_observation_t *obs,
+    size_t count,
+    const cg_options_t *opt,
+    cg_fit_cache_t *cache,
+    cg_state_t *out)
+{
+    size_t first;
+    size_t last;
+    int status;
+    if (count < 2) {
+        return CG_ERR_INVALID_ARGUMENT;
+    }
+    cg_select_extrapolation_fit_window(obs, count, opt, &first, &last);
+
+    if (cache && cache->dynamic_valid &&
+        cache->dynamic_first_index == first &&
+        cache->dynamic_last_index == last &&
+        cache->degree == opt->degree &&
+        cache->extrapolation_history_seconds == opt->extrapolation_history_seconds) {
+        *out = cache->dynamic_state;
+        return CG_OK;
+    }
+
+    status = cg_fit_state_at_index_cached(obs, count, last, first, last, opt->degree, cache, out);
+    if (status != CG_OK) {
+        return status;
+    }
+
+    if (cache) {
+        cache->dynamic_valid = 1;
+        cache->dynamic_first_index = first;
+        cache->dynamic_last_index = last;
+        cache->degree = opt->degree;
+        cache->extrapolation_history_seconds = opt->extrapolation_history_seconds;
+        cache->dynamic_state = *out;
+    }
+    return CG_OK;
 }
 
 static size_t cg_find_nearest_observation(const cg_observation_t *obs, size_t count, double unix_seconds)
@@ -1091,7 +1333,7 @@ static int cg_extrapolate_future(
         horizon > opt->max_extrapolation_seconds + 1.0e-9) {
         return CG_ERR_RANGE;
     }
-    status = cg_direct_state_at_index(obs, count, count - 1, opt, cache, &end_state);
+    status = cg_extrapolation_initial_state(obs, count, opt, cache, &end_state);
     if (status != CG_OK) {
         return status;
     }
@@ -1162,24 +1404,148 @@ static int cg_query_state_internal(
     return cg_extrapolate_future(obs, count, query, opt, aux_cache, out);
 }
 
-int cg_query_state(
-    const cg_observation_t *observations,
-    size_t count,
-    const cg_time_t *query_time_utc,
-    const cg_options_t *options,
-    cg_state_t *out_state)
+static void cg_context_invalidate_cache(cg_context_t *context)
 {
-    cg_options_t default_options;
-    cg_fit_cache_t main_cache;
-    cg_fit_cache_t aux_cache;
-    if (!observations || count < 2 || !query_time_utc || !out_state) {
+    memset(&context->main_cache, 0, sizeof(context->main_cache));
+    memset(&context->aux_cache, 0, sizeof(context->aux_cache));
+}
+
+static void cg_reverse_observations(cg_observation_t *obs, size_t first, size_t last)
+{
+    while (first < last) {
+        cg_observation_t tmp = obs[first];
+        obs[first] = obs[last];
+        obs[last] = tmp;
+        ++first;
+        --last;
+    }
+}
+
+static void cg_context_linearize(cg_context_t *context)
+{
+    size_t split;
+    if (!context || context->start == 0 || context->count == 0) {
+        return;
+    }
+
+    split = context->start;
+    if (split >= context->count) {
+        context->start = 0;
+        return;
+    }
+
+    cg_reverse_observations(context->observations, 0, split - 1);
+    cg_reverse_observations(context->observations, split, context->count - 1);
+    cg_reverse_observations(context->observations, 0, context->count - 1);
+    context->start = 0;
+    cg_context_invalidate_cache(context);
+}
+
+int cg_context_create(
+    cg_context_t **out_context,
+    cg_observation_t *observation_buffer,
+    size_t capacity,
+    const cg_options_t *options)
+{
+    cg_context_t *context;
+    if (!out_context || !observation_buffer) {
         return CG_ERR_INVALID_ARGUMENT;
     }
-    default_options = options ? *options : cg_default_options();
-    memset(&main_cache, 0, sizeof(main_cache));
-    memset(&aux_cache, 0, sizeof(aux_cache));
-    return cg_query_state_internal(observations, count, query_time_utc, &default_options,
-                                   &main_cache, &aux_cache, out_state);
+    *out_context = NULL;
+    if (capacity == 0) {
+        capacity = CG_DEFAULT_OBSERVATION_CAPACITY;
+    }
+    if (capacity < 2) {
+        return CG_ERR_INVALID_ARGUMENT;
+    }
+
+    context = (cg_context_t *)malloc(sizeof(*context));
+    if (!context) {
+        return CG_ERR_NO_MEMORY;
+    }
+    memset(context, 0, sizeof(*context));
+    context->observations = observation_buffer;
+    context->capacity = capacity;
+    context->options = options ? *options : cg_default_options();
+    cg_context_invalidate_cache(context);
+    *out_context = context;
+    return CG_OK;
+}
+
+void cg_context_reset(cg_context_t *context)
+{
+    if (!context) {
+        return;
+    }
+    context->count = 0;
+    context->start = 0;
+    cg_context_invalidate_cache(context);
+}
+
+void cg_context_destroy(cg_context_t *context)
+{
+    if (!context) {
+        return;
+    }
+    memset(context, 0, sizeof(*context));
+    free(context);
+}
+
+size_t cg_context_count(const cg_context_t *context)
+{
+    return context ? context->count : 0;
+}
+
+size_t cg_context_capacity(const cg_context_t *context)
+{
+    return context ? context->capacity : 0;
+}
+
+int cg_context_push(
+    cg_context_t *context,
+    const cg_observation_t *observation)
+{
+    size_t index;
+    if (!context || !context->observations || context->capacity < 2 || !observation) {
+        return CG_ERR_INVALID_ARGUMENT;
+    }
+    if (context->count > 0) {
+        size_t latest_index = (context->start + context->count - 1) % context->capacity;
+        double latest_time = context->observations[latest_index].time_utc.unix_seconds;
+        if (observation->time_utc.unix_seconds <= latest_time) {
+            return CG_ERR_RANGE;
+        }
+    }
+
+    if (context->count < context->capacity) {
+        index = (context->start + context->count) % context->capacity;
+        context->observations[index] = *observation;
+        ++context->count;
+    } else {
+        context->observations[context->start] = *observation;
+        context->start = (context->start + 1) % context->capacity;
+    }
+
+    cg_context_invalidate_cache(context);
+    return CG_OK;
+}
+
+int cg_context_query_state(
+    cg_context_t *context,
+    const cg_time_t *query_time_utc,
+    cg_state_t *out_state)
+{
+    if (!context || !context->observations || !query_time_utc || !out_state) {
+        return CG_ERR_INVALID_ARGUMENT;
+    }
+    if (context->count < 2) {
+        return CG_ERR_INVALID_ARGUMENT;
+    }
+
+    cg_context_linearize(context);
+    return cg_query_state_internal(context->observations, context->count, query_time_utc,
+                                   &context->options, &context->main_cache,
+                                   &context->aux_cache, out_state);
 }
 
 const char *cg_status_string(int status)

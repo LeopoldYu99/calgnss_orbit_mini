@@ -7,7 +7,7 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CalGNSSC", "CalGNSSC.vcxpro
 		{F9F947FA-44F3-44EC-9C5A-5DF528BA9481} = {F9F947FA-44F3-44EC-9C5A-5DF528BA9481}
 	EndProjectSection
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "calgnss", "calgnss.vcxproj", "{F9F947FA-44F3-44EC-9C5A-5DF528BA9481}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "calgnss_orbit_mini", "calgnss_orbit_mini.vcxproj", "{F9F947FA-44F3-44EC-9C5A-5DF528BA9481}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

@@ -1,4 +1,4 @@
-#include "calgnss.h"
+#include "calgnss_orbit_mini.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -10,12 +10,15 @@
 
 #define CSV_LINE_BUFFER 2048
 #define CSV_MAX_FIELDS 32
+#define EXAMPLE_STREAM_OBSERVATION_CAPACITY 600
 
-static const char *k_input_csv = "E:\\JC\\GNSS_OrbitDetermination\\DAT1\\ReceivedTofile-UDP-2026_5_18_14-39-28_LLA.csv";
-static const char *k_output_csv = "E:\\JC\\GNSS_OrbitDetermination\\DAT1\\ReceivedTofile-UDP-2026_5_18_14-39-28_J2000_Calculated.csv";
-static const char *k_start_time_text = "18 May 2026 07:25:00.000";
-static const char *k_end_time_text = "18 May 2026 09:35:00.000";
-static const double k_step_seconds = 1.0;
+static const char *k_input_csv = "E:\\JC\\GNSS_OrbitDetermination\\20260522\\67113_LLA.csv";
+static const char *k_output_csv = "E:\\JC\\GNSS_OrbitDetermination\\20260522\\67113_J2000_Calculated.csv";
+static const char *k_start_time_text = "18 May 2026 04:00:00.000";
+static const char *k_end_time_text = "18 May 2026 06:00:00.000";
+static const double k_step_seconds = 0.25;
+static const double k_fit_window_minutes = 10;
+static const int k_fit_degree = 9;
 
 static char *csv_trim(char *s)
 {
@@ -200,19 +203,74 @@ static int example_parse_time(const char *text, cg_time_t *out_time)
 
 static void example_format_time_iso(const cg_time_t *time_utc, char *buffer, size_t buffer_size)
 {
-    double rounded_second;
-    int sec_int;
+    double unix_ms_d;
+    int64_t unix_ms;
+    int64_t whole_seconds;
+    int milliseconds;
+    int64_t days;
+    int64_t sod;
+    int y;
+    unsigned m;
+    unsigned d;
+    int hour;
+    int minute;
+    int second;
+
     if (!time_utc || !buffer || buffer_size == 0) {
         return;
     }
-    rounded_second = floor(time_utc->second + 0.5);
-    sec_int = (int)rounded_second;
-    snprintf(buffer, buffer_size, "%04d-%02d-%02d %02d:%02d:%02d",
-             time_utc->year, time_utc->month, time_utc->day,
-             time_utc->hour, time_utc->minute, sec_int);
+
+    unix_ms_d = floor(time_utc->unix_seconds * 1000.0 + 0.5);
+    unix_ms = (int64_t)unix_ms_d;
+    whole_seconds = unix_ms / 1000;
+    milliseconds = (int)(unix_ms % 1000);
+    if (milliseconds < 0) {
+        milliseconds += 1000;
+        whole_seconds -= 1;
+    }
+
+    days = whole_seconds / 86400;
+    sod = whole_seconds % 86400;
+    if (sod < 0) {
+        sod += 86400;
+        days -= 1;
+    }
+
+    example_civil_from_days(days, &y, &m, &d);
+    hour = (int)(sod / 3600);
+    minute = (int)((sod % 3600) / 60);
+    second = (int)(sod % 60);
+
+    snprintf(buffer, buffer_size, "%04d-%02u-%02u %02d:%02d:%02d.%03d",
+             y, m, d, hour, minute, second, milliseconds);
 }
 
-static int csv_split_line(char *line, char **fields, int max_fields)
+static int csv_detect_delimiter(const char *line)
+{
+    int comma_count = 0;
+    int semicolon_count = 0;
+    int in_quotes = 0;
+    const char *p = line;
+
+    while (*p) {
+        if (*p == '"') {
+            in_quotes = !in_quotes;
+        } else if (!in_quotes) {
+            if (*p == ',') {
+                ++comma_count;
+            } else if (*p == ';') {
+                ++semicolon_count;
+            } else if (*p == '\r' || *p == '\n') {
+                break;
+            }
+        }
+        ++p;
+    }
+
+    return semicolon_count > comma_count ? ';' : ',';
+}
+
+static int csv_split_line(char *line, char **fields, int max_fields, int delimiter)
 {
     int count = 0;
     int in_quotes = 0;
@@ -221,7 +279,7 @@ static int csv_split_line(char *line, char **fields, int max_fields)
     while (*p) {
         if (*p == '"') {
             in_quotes = !in_quotes;
-        } else if (*p == ',' && !in_quotes) {
+        } else if (*p == delimiter && !in_quotes) {
             *p = '\0';
             if (count < max_fields) {
                 fields[count++] = csv_trim(start);
@@ -273,49 +331,30 @@ static int csv_find_field_contains(char **fields, int count, const char *needle)
     return -1;
 }
 
-static int compare_observations(const void *a, const void *b)
-{
-    const cg_observation_t *oa = (const cg_observation_t *)a;
-    const cg_observation_t *ob = (const cg_observation_t *)b;
-    if (oa->time_utc.unix_seconds < ob->time_utc.unix_seconds) {
-        return -1;
-    }
-    if (oa->time_utc.unix_seconds > ob->time_utc.unix_seconds) {
-        return 1;
-    }
-    return 0;
-}
-
-static int load_lla_csv(const char *path, cg_observation_t **out_observations, size_t *out_count)
-{
-    FILE *f;
-    char line[CSV_LINE_BUFFER];
-    char normalized_header[CSV_LINE_BUFFER];
-    char *fields[CSV_MAX_FIELDS];
-    int field_count;
+typedef struct csv_lla_columns_t {
     int time_col;
     int lat_col;
     int lon_col;
     int alt_col;
     int alt_is_km;
-    cg_observation_t *observations = NULL;
-    size_t count = 0;
-    size_t capacity = 0;
+    int delimiter;
+} csv_lla_columns_t;
 
-    if (!path || !out_observations || !out_count) {
+static int csv_read_lla_header(FILE *f, csv_lla_columns_t *columns)
+{
+    char line[CSV_LINE_BUFFER];
+    char normalized_header[CSV_LINE_BUFFER];
+    char *fields[CSV_MAX_FIELDS];
+    int field_count;
+
+    if (!f || !columns) {
         return CG_ERR_INVALID_ARGUMENT;
     }
-    *out_observations = NULL;
-    *out_count = 0;
 
-    f = fopen(path, "rb");
-    if (!f) {
-        return CG_ERR_IO;
-    }
     if (!fgets(line, sizeof(line), f)) {
-        fclose(f);
         return CG_ERR_PARSE;
     }
+
     {
         size_t si = 0;
         size_t di = 0;
@@ -332,68 +371,91 @@ static int load_lla_csv(const char *path, cg_observation_t **out_observations, s
         }
         normalized_header[di] = '\0';
     }
-    field_count = csv_split_line(normalized_header, fields, CSV_MAX_FIELDS);
-    time_col = csv_find_field(fields, field_count, "Time (UTCG)");
-    lat_col = csv_find_field(fields, field_count, "Lat (deg)");
-    lon_col = csv_find_field(fields, field_count, "Lon (deg)");
-    alt_col = csv_find_field(fields, field_count, "Alt (km)");
-    if (alt_col < 0) {
-        alt_col = csv_find_field_contains(fields, field_count, "Alt");
+
+    columns->delimiter = csv_detect_delimiter(normalized_header);
+    field_count = csv_split_line(normalized_header, fields, CSV_MAX_FIELDS, columns->delimiter);
+    columns->time_col = csv_find_field(fields, field_count, "Time (UTCG)");
+    columns->lat_col = csv_find_field(fields, field_count, "Lat (deg)");
+    columns->lon_col = csv_find_field(fields, field_count, "Lon (deg)");
+    columns->alt_col = csv_find_field(fields, field_count, "Alt (km)");
+    if (columns->alt_col < 0) {
+        columns->alt_col = csv_find_field_contains(fields, field_count, "Alt");
     }
-    if (time_col < 0 || lat_col < 0 || lon_col < 0 || alt_col < 0) {
-        fclose(f);
+    if (columns->time_col < 0 || columns->lat_col < 0 ||
+        columns->lon_col < 0 || columns->alt_col < 0) {
         return CG_ERR_PARSE;
     }
-    alt_is_km = strstr(fields[alt_col], "(km)") != NULL || strstr(fields[alt_col], "(KM)") != NULL;
-
-    while (fgets(line, sizeof(line), f)) {
-        cg_observation_t item;
-        char *endptr;
-        double alt_value;
-        field_count = csv_split_line(line, fields, CSV_MAX_FIELDS);
-        if (field_count <= alt_col) {
-            continue;
-        }
-        memset(&item, 0, sizeof(item));
-        if (example_parse_time(fields[time_col], &item.time_utc) != CG_OK) {
-            free(observations);
-            fclose(f);
-            return CG_ERR_PARSE;
-        }
-        errno = 0;
-        item.lat_deg = strtod(fields[lat_col], &endptr);
-        if (errno || endptr == fields[lat_col]) {
-            free(observations);
-            fclose(f);
-            return CG_ERR_PARSE;
-        }
-        item.lon_deg = strtod(fields[lon_col], &endptr);
-        alt_value = strtod(fields[alt_col], &endptr);
-        item.alt_m = alt_is_km ? alt_value * 1000.0 : alt_value;
-        if (count == capacity) {
-            size_t new_capacity = capacity == 0 ? 128 : capacity * 2;
-            cg_observation_t *new_observations =
-                (cg_observation_t *)realloc(observations, new_capacity * sizeof(*observations));
-            if (!new_observations) {
-                free(observations);
-                fclose(f);
-                return CG_ERR_NO_MEMORY;
-            }
-            observations = new_observations;
-            capacity = new_capacity;
-        }
-        observations[count++] = item;
-    }
-    fclose(f);
-    if (count < 2) {
-        free(observations);
-        return CG_ERR_PARSE;
-    }
-
-    qsort(observations, count, sizeof(*observations), compare_observations);
-    *out_observations = observations;
-    *out_count = count;
+    columns->alt_is_km =
+        strstr(fields[columns->alt_col], "(km)") != NULL ||
+        strstr(fields[columns->alt_col], "(KM)") != NULL;
     return CG_OK;
+}
+
+static int csv_parse_lla_observation(
+    char *line,
+    const csv_lla_columns_t *columns,
+    cg_observation_t *out_observation,
+    int *out_skip)
+{
+    char *fields[CSV_MAX_FIELDS];
+    int field_count;
+    int max_col;
+    char *endptr;
+    double alt_value;
+
+    if (!line || !columns || !out_observation || !out_skip) {
+        return CG_ERR_INVALID_ARGUMENT;
+    }
+    *out_skip = 0;
+    max_col = columns->time_col;
+    if (columns->lat_col > max_col) max_col = columns->lat_col;
+    if (columns->lon_col > max_col) max_col = columns->lon_col;
+    if (columns->alt_col > max_col) max_col = columns->alt_col;
+
+    field_count = csv_split_line(line, fields, CSV_MAX_FIELDS, columns->delimiter);
+    if (field_count <= max_col) {
+        *out_skip = 1;
+        return CG_OK;
+    }
+
+    memset(out_observation, 0, sizeof(*out_observation));
+    if (example_parse_time(fields[columns->time_col], &out_observation->time_utc) != CG_OK) {
+        return CG_ERR_PARSE;
+    }
+
+    errno = 0;
+    out_observation->lat_deg = strtod(fields[columns->lat_col], &endptr);
+    if (errno || endptr == fields[columns->lat_col]) {
+        return CG_ERR_PARSE;
+    }
+
+    errno = 0;
+    out_observation->lon_deg = strtod(fields[columns->lon_col], &endptr);
+    if (errno || endptr == fields[columns->lon_col]) {
+        return CG_ERR_PARSE;
+    }
+
+    errno = 0;
+    alt_value = strtod(fields[columns->alt_col], &endptr);
+    if (errno || endptr == fields[columns->alt_col]) {
+        return CG_ERR_PARSE;
+    }
+    out_observation->alt_m = columns->alt_is_km ? alt_value * 1000.0 : alt_value;
+    return CG_OK;
+}
+
+static void write_j2000_csv_row(FILE *out, const cg_time_t *time_utc, const cg_state_t *state)
+{
+    char time_text[64];
+    example_format_time_iso(time_utc, time_text, sizeof(time_text));
+    fprintf(out, "%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+            time_text,
+            state->r_j2000_m.x / 1000.0,
+            state->r_j2000_m.y / 1000.0,
+            state->r_j2000_m.z / 1000.0,
+            state->v_j2000_mps.x / 1000.0,
+            state->v_j2000_mps.y / 1000.0,
+            state->v_j2000_mps.z / 1000.0);
 }
 
 static int export_j2000_csv(
@@ -404,65 +466,130 @@ static int export_j2000_csv(
     double step_seconds,
     const cg_options_t *options)
 {
-    cg_observation_t *observations = NULL;
-    size_t count = 0;
-    cg_time_t start;
-    cg_time_t end;
+    cg_observation_t stream_buffer[EXAMPLE_STREAM_OBSERVATION_CAPACITY];
+    cg_context_t *context = NULL;
+    csv_lla_columns_t columns;
+    char line[CSV_LINE_BUFFER];
     cg_time_t current;
+    FILE *in;
     FILE *out;
+    size_t input_count = 0;
+    int have_current = 0;
+    int have_observation = 0;
     int status;
 
     if (!input_lla_csv || !output_j2000_csv || step_seconds <= 0.0) {
         return CG_ERR_INVALID_ARGUMENT;
     }
 
-    status = load_lla_csv(input_lla_csv, &observations, &count);
+    memset(&current, 0, sizeof(current));
+
+    in = fopen(input_lla_csv, "rb");
+    if (!in) {
+        return CG_ERR_IO;
+    }
+
+    status = csv_read_lla_header(in, &columns);
     if (status != CG_OK) {
+        fclose(in);
         return status;
     }
 
-    status = cg_precompute_observations(observations, count);
+    status = cg_context_create(&context, stream_buffer, EXAMPLE_STREAM_OBSERVATION_CAPACITY, options);
     if (status != CG_OK) {
-        free(observations);
+        fclose(in);
         return status;
     }
-
-    start = start_time_utc ? *start_time_utc : observations[0].time_utc;
-    end = end_time_utc ? *end_time_utc : observations[count - 1].time_utc;
 
     out = fopen(output_j2000_csv, "wb");
     if (!out) {
-        free(observations);
+        fclose(in);
+        cg_context_destroy(context);
         return CG_ERR_IO;
     }
 
     fprintf(out, "\"Time (UTCG)\",\"x (km)\",\"y (km)\",\"z (km)\",\"vx (km/sec)\",\"vy (km/sec)\",\"vz (km/sec)\"\n");
-    current = start;
-    while (current.unix_seconds <= end.unix_seconds + 1.0e-9) {
-        cg_state_t state;
-        char time_text[64];
 
-        status = cg_query_state(observations, count, &current, options, &state);
+    while (fgets(line, sizeof(line), in)) {
+        cg_observation_t observation;
+        int skip = 0;
+
+        status = csv_parse_lla_observation(line, &columns, &observation, &skip);
         if (status != CG_OK) {
+            fclose(in);
             fclose(out);
-            free(observations);
+            cg_context_destroy(context);
+            return status;
+        }
+        if (skip) {
+            continue;
+        }
+
+        if (!have_current) {
+            current = start_time_utc ? *start_time_utc : observation.time_utc;
+            have_current = 1;
+        }
+
+        status = cg_context_push(context, &observation);
+        if (status != CG_OK) {
+            fclose(in);
+            fclose(out);
+            cg_context_destroy(context);
+            return status;
+        }
+        ++input_count;
+        have_observation = 1;
+
+        while (cg_context_count(context) >= 2 &&
+               current.unix_seconds <= observation.time_utc.unix_seconds + 1.0e-9 &&
+               (!end_time_utc || current.unix_seconds <= end_time_utc->unix_seconds + 1.0e-9)) {
+            cg_state_t state;
+
+            status = cg_context_query_state(context, &current, &state);
+            if (status != CG_OK) {
+                fclose(in);
+                fclose(out);
+                cg_context_destroy(context);
+                return status;
+            }
+
+            write_j2000_csv_row(out, &current, &state);
+            current = example_time_add_seconds(&current, step_seconds);
+        }
+
+        if (end_time_utc && current.unix_seconds > end_time_utc->unix_seconds + 1.0e-9) {
+            break;
+        }
+    }
+
+    if (!have_observation || input_count < 2) {
+        fclose(in);
+        fclose(out);
+        cg_context_destroy(context);
+        return CG_ERR_PARSE;
+    }
+
+    while (have_current &&
+           end_time_utc &&
+           cg_context_count(context) >= 2 &&
+           current.unix_seconds <= end_time_utc->unix_seconds + 1.0e-9) {
+        cg_state_t state;
+
+        status = cg_context_query_state(context, &current, &state);
+        if (status != CG_OK) {
+            fclose(in);
+            fclose(out);
+            cg_context_destroy(context);
             return status;
         }
 
-        example_format_time_iso(&current, time_text, sizeof(time_text));
-        fprintf(out, "%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
-                time_text,
-                state.r_j2000_m.x / 1000.0,
-                state.r_j2000_m.y / 1000.0,
-                state.r_j2000_m.z / 1000.0,
-                state.v_j2000_mps.x / 1000.0,
-                state.v_j2000_mps.y / 1000.0,
-                state.v_j2000_mps.z / 1000.0);
+        write_j2000_csv_row(out, &current, &state);
         current = example_time_add_seconds(&current, step_seconds);
     }
 
+    fclose(in);
     fclose(out);
-    free(observations);
+    cg_context_destroy(context);
     return CG_OK;
 }
 
@@ -496,6 +623,9 @@ int main(void)
     double step_seconds = k_step_seconds;
     int status;
 
+    options.fit_window_minutes = k_fit_window_minutes;
+    options.degree = k_fit_degree;
+
     status = parse_config_time("start", k_start_time_text, &start_time, &start_ptr);
     if (status != CG_OK) {
         return 2;
@@ -514,7 +644,9 @@ int main(void)
     fprintf(stderr, "Input CSV:  %s\n", input_csv);
     fprintf(stderr, "Output CSV: %s\n", output_csv);
     fprintf(stderr, "Step: %.3f s\n", step_seconds);
+    fprintf(stderr, "Observation capacity: %d\n", EXAMPLE_STREAM_OBSERVATION_CAPACITY);
     fprintf(stderr, "Fit window: %.3f min, degree %d\n", options.fit_window_minutes, options.degree);
+    fprintf(stderr, "Extrapolation history limit: %.3f s\n", options.extrapolation_history_seconds);
     fprintf(stderr, "Future model: J2 RK4 + previous-orbit residual correction\n");
     return 0;
 }

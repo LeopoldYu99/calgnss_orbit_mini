@@ -141,13 +141,13 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="include\calgnss.h" />
+    <ClInclude Include="include\calgnss_orbit_mini.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="examples\export_j2000.c" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="calgnss.vcxproj">
+    <ProjectReference Include="calgnss_orbit_mini.vcxproj">
       <Project>{F9F947FA-44F3-44EC-9C5A-5DF528BA9481}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
       <LinkLibraryDependencies>true</LinkLibraryDependencies>

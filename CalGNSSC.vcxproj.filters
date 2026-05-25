@@ -9,7 +9,7 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="include\calgnss.h">
+    <ClInclude Include="include\calgnss_orbit_mini.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
