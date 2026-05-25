@@ -1,0 +1,12 @@
+build/
+out/
+x64/
+Win32/
+.vs/
+*.user
+*.suo
+*.pdb
+*.obj
+*.ilk
+*.lib
+*.exe
