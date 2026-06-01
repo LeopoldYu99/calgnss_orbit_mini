@@ -1,6 +1,6 @@
 # calgnss_orbit_mini
 
-`calgnss_orbit_mini` 是一个面向嵌入式/跨平台集成的 C 语言小型轨道拟合库。库接收按时间递增的 WGS-84 经纬高观测数据，在内部维护一段可配置长度的环形缓存，并根据用户查询时间输出 J2000 惯性坐标系下的位置和速度状态量。
+`calgnss_orbit_mini` 是一个面向嵌入式/跨平台集成的 C 语言小型轨道拟合库。库接收按时间递增的 ECEF/ITRS 位置观测数据，在内部维护一段可配置长度的环形缓存，并根据用户查询时间输出 J2000 惯性坐标系下的位置和速度状态量。
 
 ## 设计目标
 
@@ -20,9 +20,7 @@
 ```c
 typedef struct cg_observation_t {
     cg_time_t time_utc;
-    double lat_deg;
-    double lon_deg;
-    double alt_m;
+    cg_vec3_t r_ecef_m;
 } cg_observation_t;
 ```
 
@@ -31,15 +29,13 @@ typedef struct cg_observation_t {
 | 字段 | 单位 | 说明 |
 | --- | --- | --- |
 | `time_utc` | UTC | 观测时间。需要同时填写日历时间、`jd_utc` 和 `unix_seconds`。 |
-| `lat_deg` | degree | WGS-84 大地纬度，北纬为正。 |
-| `lon_deg` | degree | WGS-84 大地经度，东经为正。 |
-| `alt_m` | m | WGS-84 椭球高。 |
+| `r_ecef_m.x/y/z` | m | 地固系 ECEF/ITRS 位置。 |
 
 输入要求：
 
 - 数据必须按时间严格递增输入，推荐时间间隔为 1 s。
 - 允许存在不定时长的数据缺失，但查询精度会随缺口长度、观测质量和缓存覆盖范围下降。
-- 坐标基准必须为 WGS-84 经纬高。
+- 坐标基准必须为 ECEF/ITRS，单位为 m。
 - 调用方负责把外部观测数据解析为 `cg_observation_t`，本库不读文件、不访问串口、不依赖系统时间。
 
 时间结构：
@@ -60,7 +56,7 @@ typedef struct cg_time_t {
 库内部主要使用：
 
 - `jd_utc`：用于 ECEF 到 J2000 的时间相关坐标转换。
-- `unix_seconds`：用于环形缓存排序、插值拟合和外推时间差计算。
+- `unix_seconds`：用于环形缓存排序、插值拟合和时间范围检查。
 
 因此，调用方必须保证日历时间、`jd_utc` 和 `unix_seconds` 一致。
 
@@ -86,20 +82,18 @@ typedef struct cg_state_t {
 
 输出能力：
 
-- 输出 1：查询时间位于已有观测时间范围内时，输出该时刻的 J2000 状态量。查询时间可以不是原始输入数据中的时间点，支持毫秒级时间输入和插值拟合。
-- 输出 2：查询时间晚于最新观测时间时，使用已有拟合结果进行短时外推预测。按需求可配置为最多支持未来 1 小时。
+- 查询时间位于已有观测时间范围内时，输出该时刻的 J2000 状态量。查询时间可以不是原始输入数据中的时间点，支持毫秒级时间输入和插值拟合。
+- 查询时间晚于最新观测时间时返回 `CG_ERR_RANGE`；mini 版本不做未来轨道外推。
 
 目标精度：
 
 - 观测时间范围内插值：定位精度目标 `< 10 m`，测速精度目标 `< 0.2 m/s`。
-- 未来 1 小时内短时外推：定位精度目标 `< 500 m`。
 
 精度前提：
 
-- 输入 LLA 观测本身的时间和坐标误差满足目标精度要求。
+- 输入 ECEF 观测本身的时间和坐标误差满足目标精度要求。
 - 缓存中有足够连续、覆盖合理的观测数据。
-- 查询时间不能早于缓存中最早观测时间。
-- 外推精度依赖轨道高度、观测弧长、数据缺失情况和动力学模型误差，需要用目标场景数据实测确认。
+- 查询时间必须落在缓存观测时间范围内。
 
 ## 处理流程
 
@@ -109,7 +103,7 @@ typedef struct cg_state_t {
 4. 库内部以环形缓存保存最近 `N` 组观测。
 5. 调用 `cg_context_query_state()` 查询任意支持时间点的状态量。
 6. 查询时间在观测范围内时，使用局部 Chebyshev 最小二乘拟合计算位置和速度。
-7. 查询时间在未来时，使用末端拟合状态和 J2 摄动 RK4 传播进行短时外推。
+7. 查询时间超出观测范围时返回 `CG_ERR_RANGE`。
 
 ## 使用条件
 
@@ -117,16 +111,15 @@ typedef struct cg_state_t {
 
 - 编译器需支持 C99。
 - 需要支持 `double` 浮点运算。
-- 需要提供 `math.h` 中的基础数学函数，例如 `sin()`、`cos()`、`sqrt()`、`floor()`、`fmod()`、`pow()`。
+- 需要提供 `math.h` 中的基础数学函数，例如 `sin()`、`cos()`、`floor()`、`fmod()`、`isfinite()`。
 - 目标平台无需提供文件系统、线程、动态库加载、系统时间或 OS API。
 
 ### 数据条件
 
 - 至少输入 2 组观测后才能查询。
 - 观测时间必须严格递增；重复时间或倒序输入会返回 `CG_ERR_RANGE`。
-- 查询时间早于缓存最早观测时间会返回 `CG_ERR_RANGE`。
-- 如果设置了最大外推时间，查询时间超过该限制会返回 `CG_ERR_RANGE`。
-- 缺测时间越长，拟合窗口内可用数据越少，插值和外推精度越容易下降。
+- 查询时间早于缓存最早观测时间或晚于最新观测时间会返回 `CG_ERR_RANGE`。
+- 缺测时间越长，拟合窗口内可用数据越少，插值精度越容易下降。
 
 ### 缓存长度 `N`
 
@@ -142,7 +135,6 @@ cg_context_create(&ctx, obs_buffer, N, &opt);
 - `N >= 2`：接口最低要求，仅适合功能连通性测试。
 - `N = 10`：库默认值，适合极低内存 demo，不建议作为最终精度配置。
 - `N = 300 ~ 1200`：适合 1 s 输入下保存 5 到 20 分钟观测，通常是嵌入式场景更现实的起点。
-- 若需要更稳健的 1 小时外推，应尽量增加有效观测弧长；但在 128 KB RAM 约束下，需要根据平台字长、栈大小和其它模块占用控制 `N`。
 
 典型 64 位平台上，`sizeof(cg_observation_t)` 约为 72 字节，因此观测缓存内存约为：
 
@@ -157,20 +149,12 @@ buffer_bytes ~= N * sizeof(cg_observation_t)
 ```c
 typedef struct cg_options_t {
     int degree;
-    double max_extrapolation_seconds;
-    double extrapolation_history_seconds;
-    double propagation_step_seconds;
-    int enable_orbit_phase_correction;
 } cg_options_t;
 ```
 
 | 选项 | 说明 |
 | --- | --- |
 | `degree` | Chebyshev 拟合阶数，内部上限为 `CG_MAX_DEGREE`。默认 10。 |
-| `max_extrapolation_seconds` | 最大未来外推时间，`<= 0` 表示不限制。需求中建议设置为 `3600.0`。 |
-| `extrapolation_history_seconds` | 未来外推初始状态拟合使用的历史长度，`<= 0` 表示使用全部缓存。默认 7200 s。 |
-| `propagation_step_seconds` | RK4 外推积分步长。默认 10 s。 |
-| `enable_orbit_phase_correction` | 是否启用上一圈残差相位修正。默认启用。 |
 
 ## 返回码
 
@@ -178,7 +162,7 @@ typedef struct cg_options_t {
 | --- | --- |
 | `CG_OK` | 成功。 |
 | `CG_ERR_INVALID_ARGUMENT` | 输入指针为空、容量不足、数据量不足等非法参数。 |
-| `CG_ERR_RANGE` | 时间范围不支持，例如倒序输入、查询早于缓存、外推超过限制。 |
+| `CG_ERR_RANGE` | 时间范围不支持，例如倒序输入、查询早于缓存或查询晚于最新观测。 |
 | `CG_ERR_FIT` | 拟合失败，常见原因是数据量不足或几何条件差。 |
 | `CG_ERR_NO_MEMORY` | 创建上下文时内存分配失败。 |
 | `CG_ERR_PARSE` / `CG_ERR_IO` | 预留错误码，核心库当前不执行解析和 I/O。 |
@@ -187,7 +171,7 @@ typedef struct cg_options_t {
 
 ## 使用 Demo
 
-下面 demo 展示纯内存调用流程：构造时间、创建环形缓存、写入观测、查询毫秒级插值点和未来外推点。示例中的 LLA 数据只用于演示 API，不代表真实轨道数据。
+下面 demo 展示纯内存调用流程：构造时间、创建环形缓存、写入观测、查询毫秒级插值点。示例中的 ECEF 数据只用于演示 API，不代表真实轨道数据。
 
 ```c
 #include "calgnss_orbit_mini.h"
@@ -315,15 +299,11 @@ int main(void)
     cg_options_t opt;
     cg_time_t t0;
     cg_time_t query_interp;
-    cg_time_t query_future;
     cg_state_t state;
     int status;
     int i;
 
     opt = cg_default_options();
-    opt.max_extrapolation_seconds = 3600.0;
-    opt.extrapolation_history_seconds = 1200.0;
-    opt.propagation_step_seconds = 10.0;
 
     status = cg_context_create(&ctx, obs_buffer, OBS_CAPACITY, &opt);
     if (status != CG_OK) {
@@ -337,9 +317,9 @@ int main(void)
         cg_observation_t obs;
 
         obs.time_utc = demo_add_seconds(&t0, (double)i);
-        obs.lat_deg = 22.500000 + 0.000100 * sin((double)i * 0.01);
-        obs.lon_deg = 113.900000 + 0.000100 * cos((double)i * 0.01);
-        obs.alt_m = 500000.0 + 20.0 * sin((double)i * 0.02);
+        obs.r_ecef_m.x = 6800000.0 * cos((double)i * 0.001);
+        obs.r_ecef_m.y = 6800000.0 * sin((double)i * 0.001);
+        obs.r_ecef_m.z = 500000.0 * sin((double)i * 0.002);
 
         status = cg_context_push(ctx, &obs);
         if (status != CG_OK) {
@@ -358,17 +338,6 @@ int main(void)
                state.v_j2000_mps.x, state.v_j2000_mps.y, state.v_j2000_mps.z);
     } else {
         printf("interpolation query failed: %s\n", cg_status_string(status));
-    }
-
-    query_future = demo_add_seconds(&t0, 600.0 + 1800.0);
-    status = cg_context_query_state(ctx, &query_future, &state);
-    if (status == CG_OK) {
-        printf("future J2000 r = %.3f %.3f %.3f m\n",
-               state.r_j2000_m.x, state.r_j2000_m.y, state.r_j2000_m.z);
-        printf("future J2000 v = %.6f %.6f %.6f m/s\n",
-               state.v_j2000_mps.x, state.v_j2000_mps.y, state.v_j2000_mps.z);
-    } else {
-        printf("future query failed: %s\n", cg_status_string(status));
     }
 
     cg_context_destroy(ctx);
@@ -418,8 +387,7 @@ const char *cg_status_string(int status);
 
 ## 算法概要
 
-- WGS-84 经纬高转换为 ECEF。
-- ECEF 转换到 J2000/GCRS，内部使用紧凑的 IAU 2000B 章动/岁差和格林尼治视恒星时模型。
+- ECEF/ITRS 转换到 J2000/GCRS，内部使用紧凑的 IAU 2000B 章动/岁差、UT1-UTC、极移和格林尼治视恒星时模型。
+- 库内置 2026 年 EOP 日表；表内按 MJD 线性插值，表外使用最近端点值。
 - 观测范围内查询使用局部 Chebyshev 最小二乘位置拟合，速度由拟合多项式解析求导得到。
-- 未来查询使用末端拟合状态进行 RK4 + J2 摄动传播。
-- 若缓存历史满足条件，可启用上一圈残差相位修正，改善短时外推稳定性。
+- 未来查询不做轨道外推，直接返回 `CG_ERR_RANGE`。

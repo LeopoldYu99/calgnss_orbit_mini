@@ -2,7 +2,6 @@
 
 #include <float.h>
 #include <math.h>
-#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -11,25 +10,15 @@
 #endif
 
 #define CG_D2PI (2.0 * CG_PI)
-#define CG_DEG2RAD (CG_PI / 180.0)
 #define CG_ARCSEC2RAD (CG_PI / (180.0 * 3600.0))
 #define CG_MAS2RAD (CG_ARCSEC2RAD / 1000.0)
 #define CG_JD_J2000 2451545.0
 #define CG_JULIAN_CENTURY 36525.0
 #define CG_TT_MINUS_UTC_SECONDS 69.184
+#define CG_SECONDS_PER_DAY 86400.0
 
-#define CG_MU_EARTH 3.986004418e14
 #define CG_OMEGA_EARTH 7.2921150e-5
-#define CG_J2_EARTH 1.08262668e-3
-#define CG_WGS84_A 6378137.0
-#define CG_WGS84_F (1.0 / 298.257223563)
-#define CG_DIRECT_VELOCITY_WINDOW 9
-#define CG_DIRECT_VELOCITY_DEGREE 8
-#define CG_FIT_WINDOW_MINUTES 60.0
-#define CG_DYNAMIC_FIT_MIN_OBSERVATIONS 6
-#define CG_DYNAMIC_FIT_ITERATIONS 4
-#define CG_DYNAMIC_FIT_POSITION_SCALE_M 100.0
-#define CG_DYNAMIC_FIT_VELOCITY_SCALE_MPS 0.1
+#define CG_FIT_WINDOW_SECONDS 300.0
 
 typedef struct cg_fit_t {
     int degree;
@@ -42,15 +31,10 @@ typedef struct cg_fit_t {
 
 typedef struct cg_fit_cache_t {
     int valid;
-    int dynamic_valid;
     int degree;
     size_t first_index;
     size_t last_index;
-    size_t dynamic_first_index;
-    size_t dynamic_last_index;
-    double extrapolation_history_seconds;
     cg_fit_t fit;
-    cg_state_t dynamic_state;
 } cg_fit_cache_t;
 
 struct cg_context_t {
@@ -60,13 +44,22 @@ struct cg_context_t {
     size_t start;
     cg_options_t options;
     cg_fit_cache_t main_cache;
-    cg_fit_cache_t aux_cache;
 };
 
-static double cg_vec_dot(cg_vec3_t a, cg_vec3_t b)
-{
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
+typedef struct cg_eop_record_t {
+    int mjd;
+    double dut1_seconds;
+    double x_pole_arcsec;
+    double y_pole_arcsec;
+} cg_eop_record_t;
+
+typedef struct cg_eop_value_t {
+    double dut1_seconds;
+    double x_pole_rad;
+    double y_pole_rad;
+} cg_eop_value_t;
+
+#include "eop_2026.inc"
 
 static cg_vec3_t cg_vec_add(cg_vec3_t a, cg_vec3_t b)
 {
@@ -75,29 +68,6 @@ static cg_vec3_t cg_vec_add(cg_vec3_t a, cg_vec3_t b)
     r.y = a.y + b.y;
     r.z = a.z + b.z;
     return r;
-}
-
-static cg_vec3_t cg_vec_sub(cg_vec3_t a, cg_vec3_t b)
-{
-    cg_vec3_t r;
-    r.x = a.x - b.x;
-    r.y = a.y - b.y;
-    r.z = a.z - b.z;
-    return r;
-}
-
-static cg_vec3_t cg_vec_scale(cg_vec3_t a, double s)
-{
-    cg_vec3_t r;
-    r.x = a.x * s;
-    r.y = a.y * s;
-    r.z = a.z * s;
-    return r;
-}
-
-static double cg_vec_norm(cg_vec3_t a)
-{
-    return sqrt(cg_vec_dot(a, a));
 }
 
 static double cg_anp(double angle)
@@ -194,117 +164,68 @@ static void cg_rz_vector_matrix(double angle, double r[3][3])
     r[2][0] = 0.0; r[2][1] = 0.0; r[2][2] = 1.0;
 }
 
-static int64_t cg_days_from_civil(int y, unsigned m, unsigned d)
+static double cg_mjd_from_jd(double jd)
 {
-    int era;
-    unsigned yoe;
-    unsigned doy;
-    unsigned doe;
-    int mp;
-    y -= (m <= 2U);
-    era = (y >= 0 ? y : y - 399) / 400;
-    yoe = (unsigned)(y - era * 400);
-    mp = (int)m + ((m > 2U) ? -3 : 9);
-    doy = (unsigned)((153 * mp + 2) / 5) + d - 1U;
-    doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
-    return (int64_t)era * 146097 + (int64_t)doe - 719468;
+    return jd - 2400000.5;
 }
 
-static void cg_civil_from_days(int64_t z, int *y, unsigned *m, unsigned *d)
+static cg_eop_value_t cg_eop_from_record(const cg_eop_record_t *record)
 {
-    int era;
-    unsigned doe;
-    unsigned yoe;
-    unsigned doy;
-    unsigned mp;
-    z += 719468;
-    era = (int)((z >= 0 ? z : z - 146096) / 146097);
-    doe = (unsigned)(z - (int64_t)era * 146097);
-    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    *y = (int)yoe + era * 400;
-    doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    mp = (5 * doy + 2) / 153;
-    *d = doy - (153 * mp + 2) / 5 + 1;
-    *m = mp + (mp < 10 ? 3U : (unsigned)-9);
-    *y += (*m <= 2U);
+    cg_eop_value_t value;
+    value.dut1_seconds = record->dut1_seconds;
+    value.x_pole_rad = record->x_pole_arcsec * CG_ARCSEC2RAD;
+    value.y_pole_rad = record->y_pole_arcsec * CG_ARCSEC2RAD;
+    return value;
 }
 
-static double cg_jd_from_calendar(int y, int m, int d, int hour, int minute, double second)
+static cg_eop_value_t cg_interpolate_eop(
+    const cg_eop_record_t *a,
+    const cg_eop_record_t *b,
+    double mjd_utc)
 {
-    int yy = y;
-    int mm = m;
-    int a;
-    int b;
-    double day;
-    if (mm <= 2) {
-        yy -= 1;
-        mm += 12;
+    double span = (double)(b->mjd - a->mjd);
+    double f = span > 0.0 ? (mjd_utc - (double)a->mjd) / span : 0.0;
+    cg_eop_value_t value;
+    value.dut1_seconds = a->dut1_seconds + f * (b->dut1_seconds - a->dut1_seconds);
+    value.x_pole_rad = (a->x_pole_arcsec + f * (b->x_pole_arcsec - a->x_pole_arcsec)) * CG_ARCSEC2RAD;
+    value.y_pole_rad = (a->y_pole_arcsec + f * (b->y_pole_arcsec - a->y_pole_arcsec)) * CG_ARCSEC2RAD;
+    return value;
+}
+
+static cg_eop_value_t cg_lookup_eop(double mjd_utc)
+{
+    size_t count = sizeof(k_cg_eop_2026) / sizeof(k_cg_eop_2026[0]);
+    size_t i;
+    cg_eop_value_t empty;
+    empty.dut1_seconds = 0.0;
+    empty.x_pole_rad = 0.0;
+    empty.y_pole_rad = 0.0;
+    if (count == 0U) {
+        return empty;
     }
-    a = yy / 100;
-    b = 2 - a + a / 4;
-    day = (double)d + ((double)hour + ((double)minute + second / 60.0) / 60.0) / 24.0;
-    return floor(365.25 * (double)(yy + 4716)) +
-           floor(30.6001 * (double)(mm + 1)) +
-           day + (double)b - 1524.5;
-}
-
-static cg_time_t cg_time_from_calendar(int y, int m, int d, int hour, int minute, double second)
-{
-    cg_time_t t;
-    int whole_second = (int)floor(second);
-    double frac = second - (double)whole_second;
-    int64_t days = cg_days_from_civil(y, (unsigned)m, (unsigned)d);
-    t.year = y;
-    t.month = m;
-    t.day = d;
-    t.hour = hour;
-    t.minute = minute;
-    t.second = second;
-    t.jd_utc = cg_jd_from_calendar(y, m, d, hour, minute, second);
-    t.unix_seconds = (double)days * 86400.0 + (double)hour * 3600.0 +
-                     (double)minute * 60.0 + (double)whole_second + frac;
-    return t;
-}
-
-static cg_time_t cg_time_add_seconds(const cg_time_t *time_utc, double seconds)
-{
-    double u = time_utc->unix_seconds + seconds;
-    double whole_d = floor(u);
-    int64_t whole = (int64_t)whole_d;
-    double frac = u - whole_d;
-    int64_t days = whole / 86400;
-    int64_t sod = whole % 86400;
-    int y;
-    unsigned m;
-    unsigned d;
-    int hour;
-    int minute;
-    if (sod < 0) {
-        sod += 86400;
-        days -= 1;
+    if (mjd_utc <= (double)k_cg_eop_2026[0].mjd) {
+        return cg_eop_from_record(&k_cg_eop_2026[0]);
     }
-    cg_civil_from_days(days, &y, &m, &d);
-    hour = (int)(sod / 3600);
-    minute = (int)((sod % 3600) / 60);
-    return cg_time_from_calendar(y, (int)m, (int)d, hour, minute,
-                                 (double)(sod % 60) + frac);
+    if (mjd_utc >= (double)k_cg_eop_2026[count - 1U].mjd) {
+        return cg_eop_from_record(&k_cg_eop_2026[count - 1U]);
+    }
+    for (i = 1U; i < count; ++i) {
+        if (mjd_utc <= (double)k_cg_eop_2026[i].mjd) {
+            return cg_interpolate_eop(&k_cg_eop_2026[i - 1U], &k_cg_eop_2026[i], mjd_utc);
+        }
+    }
+    return empty;
 }
 
-static cg_vec3_t cg_geodetic_to_ecef(double lat_deg, double lon_deg, double h_m)
+static void cg_polar_motion_matrix(double xp, double yp, double out[3][3])
 {
-    const double e2 = CG_WGS84_F * (2.0 - CG_WGS84_F);
-    double lat = lat_deg * CG_DEG2RAD;
-    double lon = lon_deg * CG_DEG2RAD;
-    double sin_lat = sin(lat);
-    double cos_lat = cos(lat);
-    double sin_lon = sin(lon);
-    double cos_lon = cos(lon);
-    double n = CG_WGS84_A / sqrt(1.0 - e2 * sin_lat * sin_lat);
-    cg_vec3_t r;
-    r.x = (n + h_m) * cos_lat * cos_lon;
-    r.y = (n + h_m) * cos_lat * sin_lon;
-    r.z = (n * (1.0 - e2) + h_m) * sin_lat;
-    return r;
+    double ry_mat[3][3];
+    double rx_mat[3][3];
+    cg_mat_identity(ry_mat);
+    cg_mat_identity(rx_mat);
+    cg_ry(-xp, ry_mat);
+    cg_rx(-yp, rx_mat);
+    cg_mat_mul(ry_mat, rx_mat, out);
 }
 
 typedef struct cg_nut_term_t {
@@ -513,24 +434,30 @@ static double cg_gmst00(double jd_ut1, double jd_tt)
 static void cg_itrs_to_j2000_matrix(const cg_time_t *time_utc, double out[3][3])
 {
     double jd_utc = time_utc->jd_utc;
-    double jd_tt = jd_utc + CG_TT_MINUS_UTC_SECONDS / 86400.0;
+    double jd_tt = jd_utc + CG_TT_MINUS_UTC_SECONDS / CG_SECONDS_PER_DAY;
+    cg_eop_value_t eop = cg_lookup_eop(cg_mjd_from_jd(jd_utc));
+    double jd_ut1 = jd_utc + eop.dut1_seconds / CG_SECONDS_PER_DAY;
     double rbpn[3][3];
     double rbpn_t[3][3];
     double rz[3][3];
+    double pm[3][3];
+    double rot_pm[3][3];
     double dpsi;
     double epsa;
     double gst;
     int i;
     int j;
     cg_pnm00b(jd_tt, rbpn, &dpsi, &epsa);
-    gst = cg_anp(cg_gmst00(jd_utc, jd_tt) + dpsi * cos(epsa));
+    gst = cg_anp(cg_gmst00(jd_ut1, jd_tt) + dpsi * cos(epsa));
     for (i = 0; i < 3; ++i) {
         for (j = 0; j < 3; ++j) {
             rbpn_t[i][j] = rbpn[j][i];
         }
     }
     cg_rz_vector_matrix(gst, rz);
-    cg_mat_mul(rbpn_t, rz, out);
+    cg_polar_motion_matrix(-eop.x_pole_rad, -eop.y_pole_rad, pm);
+    cg_mat_mul(rz, pm, rot_pm);
+    cg_mat_mul(rbpn_t, rot_pm, out);
 }
 
 static void cg_ecef_to_j2000(
@@ -555,15 +482,12 @@ static void cg_ecef_to_j2000(
 static cg_vec3_t cg_observation_to_j2000_position(const cg_observation_t *observation)
 {
     cg_vec3_t zero;
-    cg_vec3_t r_ecef;
     cg_vec3_t r_j2000;
     cg_vec3_t ignored_v_j2000;
     zero.x = zero.y = zero.z = 0.0;
-    r_ecef = cg_geodetic_to_ecef(
-        observation->lat_deg, observation->lon_deg, observation->alt_m);
     cg_ecef_to_j2000(
         &observation->time_utc,
-        r_ecef,
+        observation->r_ecef_m,
         zero,
         &r_j2000,
         &ignored_v_j2000);
@@ -582,10 +506,6 @@ cg_options_t cg_default_options(void)
 {
     cg_options_t opt;
     opt.degree = 10;
-    opt.max_extrapolation_seconds = 0.0;
-    opt.extrapolation_history_seconds = 7200.0;
-    opt.propagation_step_seconds = 10.0;
-    opt.enable_orbit_phase_correction = 1;
     return opt;
 }
 
@@ -596,7 +516,7 @@ static void cg_select_window(
     size_t *first,
     size_t *last)
 {
-    double half_window = CG_FIT_WINDOW_MINUTES * 30.0;
+    double half_window = 0.5 * CG_FIT_WINDOW_SECONDS;
     double q = query->unix_seconds;
     size_t i;
     size_t f = 0;
@@ -686,111 +606,6 @@ static int cg_solve_linear(int n, double a[CG_MAX_DEGREE + 1][CG_MAX_DEGREE + 2]
             sum -= a[i][j] * x[j];
         }
         x[i] = sum / a[i][i];
-    }
-    return CG_OK;
-}
-
-static int cg_estimate_velocity_at_index(
-    const cg_observation_t *obs,
-    size_t count,
-    size_t index,
-    cg_vec3_t *out_velocity)
-{
-    size_t first;
-    size_t last;
-    size_t nobs;
-    size_t i;
-    int degree;
-    int ncoef;
-    int j;
-    int k;
-    int coord;
-    double center_seconds;
-    double scale_seconds = 0.0;
-    double ata[CG_MAX_DEGREE + 1][CG_MAX_DEGREE + 1];
-    double rhs[3][CG_MAX_DEGREE + 1];
-
-    if (!obs || !out_velocity || index >= count || count < 2) {
-        return CG_ERR_INVALID_ARGUMENT;
-    }
-
-    first = index;
-    if (first > CG_DIRECT_VELOCITY_WINDOW / 2) {
-        first -= CG_DIRECT_VELOCITY_WINDOW / 2;
-    } else {
-        first = 0;
-    }
-    last = first + CG_DIRECT_VELOCITY_WINDOW - 1;
-    if (last >= count) {
-        last = count - 1;
-        first = last + 1 > CG_DIRECT_VELOCITY_WINDOW ? last + 1 - CG_DIRECT_VELOCITY_WINDOW : 0;
-    }
-    nobs = last - first + 1;
-    degree = (int)nobs - 1;
-    if (degree > CG_DIRECT_VELOCITY_DEGREE) {
-        degree = CG_DIRECT_VELOCITY_DEGREE;
-    }
-    if (degree < 1) {
-        return CG_ERR_FIT;
-    }
-    ncoef = degree + 1;
-    center_seconds = obs[index].time_utc.unix_seconds;
-    for (i = first; i <= last; ++i) {
-        double dt = fabs(obs[i].time_utc.unix_seconds - center_seconds);
-        if (dt > scale_seconds) {
-            scale_seconds = dt;
-        }
-    }
-    if (scale_seconds <= 0.0) {
-        return CG_ERR_FIT;
-    }
-
-    memset(ata, 0, sizeof(ata));
-    memset(rhs, 0, sizeof(rhs));
-    for (i = first; i <= last; ++i) {
-        double powers[CG_MAX_DEGREE + 1];
-        double tau = (obs[i].time_utc.unix_seconds - center_seconds) / scale_seconds;
-        cg_vec3_t r_j2000 = cg_observation_to_j2000_position(&obs[i]);
-        powers[0] = 1.0;
-        for (j = 1; j < ncoef; ++j) {
-            powers[j] = powers[j - 1] * tau;
-        }
-        for (j = 0; j < ncoef; ++j) {
-            for (k = 0; k < ncoef; ++k) {
-                ata[j][k] += powers[j] * powers[k];
-            }
-            rhs[0][j] += powers[j] * r_j2000.x;
-            rhs[1][j] += powers[j] * r_j2000.y;
-            rhs[2][j] += powers[j] * r_j2000.z;
-        }
-    }
-
-    out_velocity->x = 0.0;
-    out_velocity->y = 0.0;
-    out_velocity->z = 0.0;
-    for (coord = 0; coord < 3; ++coord) {
-        double aug[CG_MAX_DEGREE + 1][CG_MAX_DEGREE + 2];
-        double coeff[CG_MAX_DEGREE + 1];
-        int status;
-        memset(aug, 0, sizeof(aug));
-        memset(coeff, 0, sizeof(coeff));
-        for (j = 0; j < ncoef; ++j) {
-            for (k = 0; k < ncoef; ++k) {
-                aug[j][k] = ata[j][k];
-            }
-            aug[j][ncoef] = rhs[coord][j];
-        }
-        status = cg_solve_linear(ncoef, aug, coeff);
-        if (status != CG_OK) {
-            return status;
-        }
-        if (coord == 0) {
-            out_velocity->x = coeff[1] / scale_seconds;
-        } else if (coord == 1) {
-            out_velocity->y = coeff[1] / scale_seconds;
-        } else {
-            out_velocity->z = coeff[1] / scale_seconds;
-        }
     }
     return CG_OK;
 }
@@ -958,435 +773,12 @@ static int cg_interpolate_state_cached(
     return CG_OK;
 }
 
-static void cg_select_extrapolation_fit_window(
-    const cg_observation_t *obs,
-    size_t count,
-    const cg_options_t *opt,
-    size_t *first,
-    size_t *last)
-{
-    size_t f = 0;
-    size_t l = count - 1;
-    if (opt->extrapolation_history_seconds > 0.0) {
-        double earliest = obs[l].time_utc.unix_seconds - opt->extrapolation_history_seconds;
-        while (f < l && obs[f].time_utc.unix_seconds < earliest) {
-            ++f;
-        }
-        if (f >= l && l > 0) {
-            f = l - 1;
-        }
-    }
-    *first = f;
-    *last = l;
-}
-
-static int cg_fit_state_at_index_cached(
-    const cg_observation_t *obs,
-    size_t count,
-    size_t index,
-    size_t first,
-    size_t last,
-    int degree,
-    cg_fit_cache_t *cache,
-    cg_state_t *out)
-{
-    int status;
-    if (!obs || !out || index >= count || last >= count || last < first || index < first || index > last) {
-        return CG_ERR_INVALID_ARGUMENT;
-    }
-    if (!cache || !cache->valid || cache->first_index != first || cache->last_index != last || cache->degree != degree) {
-        cg_fit_t fit;
-        status = cg_build_fit(obs, first, last, degree, &fit);
-        if (status != CG_OK) {
-            return status;
-        }
-        if (cache) {
-            cache->valid = 1;
-            cache->degree = degree;
-            cache->first_index = first;
-            cache->last_index = last;
-            cache->fit = fit;
-        } else {
-            cg_fit_eval(&fit, &obs[index].time_utc, out);
-            return CG_OK;
-        }
-    }
-    cg_fit_eval(&cache->fit, &obs[index].time_utc, out);
-    return CG_OK;
-}
-
-static cg_vec3_t cg_j2_acceleration(cg_vec3_t r)
-{
-    double radius = cg_vec_norm(r);
-    double r2 = radius * radius;
-    double z2 = r.z * r.z;
-    double scale = 1.5 * CG_J2_EARTH * CG_MU_EARTH * CG_WGS84_A * CG_WGS84_A / pow(radius, 5.0);
-    double z_factor = 5.0 * z2 / r2;
-    cg_vec3_t a;
-    double two = -CG_MU_EARTH / (radius * radius * radius);
-    a.x = two * r.x + scale * r.x * (z_factor - 1.0);
-    a.y = two * r.y + scale * r.y * (z_factor - 1.0);
-    a.z = two * r.z + scale * r.z * (z_factor - 3.0);
-    return a;
-}
-
-static void cg_state_derivative(const double y[6], double dy[6])
-{
-    cg_vec3_t r;
-    cg_vec3_t a;
-    r.x = y[0]; r.y = y[1]; r.z = y[2];
-    a = cg_j2_acceleration(r);
-    dy[0] = y[3]; dy[1] = y[4]; dy[2] = y[5];
-    dy[3] = a.x; dy[4] = a.y; dy[5] = a.z;
-}
-
-static int cg_propagate_j2(cg_vec3_t r0, cg_vec3_t v0, double dt, double step_seconds, cg_vec3_t *r, cg_vec3_t *v)
-{
-    double y[6];
-    double remaining;
-    double direction;
-    int i;
-    if (step_seconds <= 0.0) {
-        return CG_ERR_INVALID_ARGUMENT;
-    }
-    y[0] = r0.x; y[1] = r0.y; y[2] = r0.z;
-    y[3] = v0.x; y[4] = v0.y; y[5] = v0.z;
-    remaining = fabs(dt);
-    direction = dt >= 0.0 ? 1.0 : -1.0;
-    while (remaining > 1.0e-12) {
-        double h = direction * fmin(step_seconds, remaining);
-        double k1[6], k2[6], k3[6], k4[6], tmp[6];
-        cg_state_derivative(y, k1);
-        for (i = 0; i < 6; ++i) tmp[i] = y[i] + 0.5 * h * k1[i];
-        cg_state_derivative(tmp, k2);
-        for (i = 0; i < 6; ++i) tmp[i] = y[i] + 0.5 * h * k2[i];
-        cg_state_derivative(tmp, k3);
-        for (i = 0; i < 6; ++i) tmp[i] = y[i] + h * k3[i];
-        cg_state_derivative(tmp, k4);
-        for (i = 0; i < 6; ++i) {
-            y[i] += (h / 6.0) * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]);
-        }
-        remaining -= fabs(h);
-    }
-    r->x = y[0]; r->y = y[1]; r->z = y[2];
-    v->x = y[3]; v->y = y[4]; v->z = y[5];
-    return CG_OK;
-}
-
-static int cg_dynamic_fit_state(
-    const cg_observation_t *obs,
-    size_t first,
-    size_t last,
-    const cg_options_t *opt,
-    cg_state_t *state)
-{
-    static const double scale[6] = {
-        CG_DYNAMIC_FIT_POSITION_SCALE_M,
-        CG_DYNAMIC_FIT_POSITION_SCALE_M,
-        CG_DYNAMIC_FIT_POSITION_SCALE_M,
-        CG_DYNAMIC_FIT_VELOCITY_SCALE_MPS,
-        CG_DYNAMIC_FIT_VELOCITY_SCALE_MPS,
-        CG_DYNAMIC_FIT_VELOCITY_SCALE_MPS
-    };
-    double x[6];
-    int iter;
-    if (!obs || !opt || !state || last < first ||
-        last - first + 1 < CG_DYNAMIC_FIT_MIN_OBSERVATIONS) {
-        return CG_ERR_INVALID_ARGUMENT;
-    }
-
-    x[0] = state->r_j2000_m.x;
-    x[1] = state->r_j2000_m.y;
-    x[2] = state->r_j2000_m.z;
-    x[3] = state->v_j2000_mps.x;
-    x[4] = state->v_j2000_mps.y;
-    x[5] = state->v_j2000_mps.z;
-
-    for (iter = 0; iter < CG_DYNAMIC_FIT_ITERATIONS; ++iter) {
-        double normal[CG_MAX_DEGREE + 1][CG_MAX_DEGREE + 2];
-        double delta_scaled[CG_MAX_DEGREE + 1];
-        double max_diag = 0.0;
-        size_t i;
-        int row;
-        int col;
-        int status;
-        memset(normal, 0, sizeof(normal));
-        memset(delta_scaled, 0, sizeof(delta_scaled));
-
-        for (i = first; i <= last; ++i) {
-            double dt = obs[i].time_utc.unix_seconds - obs[last].time_utc.unix_seconds;
-            cg_vec3_t observed = cg_observation_to_j2000_position(&obs[i]);
-            cg_vec3_t base_r;
-            cg_vec3_t base_v;
-            double residual[3];
-            double jac[3][6];
-
-            status = cg_propagate_j2((cg_vec3_t){x[0], x[1], x[2]},
-                                     (cg_vec3_t){x[3], x[4], x[5]},
-                                     dt, opt->propagation_step_seconds,
-                                     &base_r, &base_v);
-            if (status != CG_OK) {
-                return status;
-            }
-            residual[0] = base_r.x - observed.x;
-            residual[1] = base_r.y - observed.y;
-            residual[2] = base_r.z - observed.z;
-
-            for (col = 0; col < 6; ++col) {
-                double xp[6];
-                cg_vec3_t pert_r;
-                cg_vec3_t pert_v;
-                memcpy(xp, x, sizeof(xp));
-                xp[col] += scale[col];
-                status = cg_propagate_j2((cg_vec3_t){xp[0], xp[1], xp[2]},
-                                         (cg_vec3_t){xp[3], xp[4], xp[5]},
-                                         dt, opt->propagation_step_seconds,
-                                         &pert_r, &pert_v);
-                if (status != CG_OK) {
-                    return status;
-                }
-                jac[0][col] = pert_r.x - base_r.x;
-                jac[1][col] = pert_r.y - base_r.y;
-                jac[2][col] = pert_r.z - base_r.z;
-            }
-
-            for (row = 0; row < 6; ++row) {
-                for (col = 0; col < 6; ++col) {
-                    normal[row][col] += jac[0][row] * jac[0][col] +
-                                        jac[1][row] * jac[1][col] +
-                                        jac[2][row] * jac[2][col];
-                }
-                normal[row][6] -= jac[0][row] * residual[0] +
-                                  jac[1][row] * residual[1] +
-                                  jac[2][row] * residual[2];
-            }
-        }
-
-        for (row = 0; row < 6; ++row) {
-            double d = fabs(normal[row][row]);
-            if (d > max_diag) {
-                max_diag = d;
-            }
-        }
-        if (max_diag <= 0.0) {
-            return CG_ERR_FIT;
-        }
-        for (row = 0; row < 6; ++row) {
-            normal[row][row] += max_diag * 1.0e-10;
-        }
-
-        status = cg_solve_linear(6, normal, delta_scaled);
-        if (status != CG_OK) {
-            return status;
-        }
-
-        for (row = 0; row < 6; ++row) {
-            x[row] += delta_scaled[row] * scale[row];
-        }
-    }
-
-    state->time_utc = obs[last].time_utc;
-    state->r_j2000_m.x = x[0];
-    state->r_j2000_m.y = x[1];
-    state->r_j2000_m.z = x[2];
-    state->v_j2000_mps.x = x[3];
-    state->v_j2000_mps.y = x[4];
-    state->v_j2000_mps.z = x[5];
-    return CG_OK;
-}
-
-static int cg_direct_state_at_index(
-    const cg_observation_t *obs,
-    size_t count,
-    size_t index,
-    const cg_options_t *opt,
-    cg_fit_cache_t *cache,
-    cg_state_t *out)
-{
-    int status;
-    if (index >= count) {
-        return CG_ERR_INVALID_ARGUMENT;
-    }
-    out->time_utc = obs[index].time_utc;
-    out->r_j2000_m = cg_observation_to_j2000_position(&obs[index]);
-    status = cg_interpolate_state_cached(obs, count, &obs[index].time_utc, opt, cache, out);
-    if (status == CG_OK) {
-        out->r_j2000_m = cg_observation_to_j2000_position(&obs[index]);
-        return CG_OK;
-    }
-    out->time_utc = obs[index].time_utc;
-    out->r_j2000_m = cg_observation_to_j2000_position(&obs[index]);
-    status = cg_estimate_velocity_at_index(obs, count, index, &out->v_j2000_mps);
-    if (status == CG_OK) {
-        return CG_OK;
-    }
-    return status;
-}
-
-static int cg_extrapolation_initial_state(
-    const cg_observation_t *obs,
-    size_t count,
-    const cg_options_t *opt,
-    cg_fit_cache_t *cache,
-    cg_state_t *out)
-{
-    size_t first;
-    size_t last;
-    int status;
-    if (count < 2) {
-        return CG_ERR_INVALID_ARGUMENT;
-    }
-    cg_select_extrapolation_fit_window(obs, count, opt, &first, &last);
-
-    if (cache && cache->dynamic_valid &&
-        cache->dynamic_first_index == first &&
-        cache->dynamic_last_index == last &&
-        cache->degree == opt->degree &&
-        cache->extrapolation_history_seconds == opt->extrapolation_history_seconds) {
-        *out = cache->dynamic_state;
-        return CG_OK;
-    }
-
-    status = cg_fit_state_at_index_cached(obs, count, last, first, last, opt->degree, cache, out);
-    if (status != CG_OK) {
-        return status;
-    }
-
-    if (cache) {
-        cache->dynamic_valid = 1;
-        cache->dynamic_first_index = first;
-        cache->dynamic_last_index = last;
-        cache->degree = opt->degree;
-        cache->extrapolation_history_seconds = opt->extrapolation_history_seconds;
-        cache->dynamic_state = *out;
-    }
-    return CG_OK;
-}
-
-static size_t cg_find_nearest_observation(const cg_observation_t *obs, size_t count, double unix_seconds)
-{
-    size_t lo = 0;
-    size_t hi = count;
-    if (unix_seconds <= obs[0].time_utc.unix_seconds) {
-        return 0;
-    }
-    if (unix_seconds >= obs[count - 1].time_utc.unix_seconds) {
-        return count - 1;
-    }
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (obs[mid].time_utc.unix_seconds < unix_seconds) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    if (lo == 0) {
-        return 0;
-    }
-    if (fabs(obs[lo].time_utc.unix_seconds - unix_seconds) <
-        fabs(obs[lo - 1].time_utc.unix_seconds - unix_seconds)) {
-        return lo;
-    }
-    return lo - 1;
-}
-
-static double cg_orbital_period_seconds(cg_vec3_t r, cg_vec3_t v)
-{
-    double rn = cg_vec_norm(r);
-    double v2 = cg_vec_dot(v, v);
-    double denom = 2.0 / rn - v2 / CG_MU_EARTH;
-    double a;
-    if (denom <= 0.0) {
-        return 0.0;
-    }
-    a = 1.0 / denom;
-    if (a <= 0.0) {
-        return 0.0;
-    }
-    return CG_D2PI * sqrt((a * a * a) / CG_MU_EARTH);
-}
-
-static int cg_extrapolate_future(
-    const cg_observation_t *obs,
-    size_t count,
-    const cg_time_t *query,
-    const cg_options_t *opt,
-    cg_fit_cache_t *cache,
-    cg_state_t *out)
-{
-    double horizon = query->unix_seconds - obs[count - 1].time_utc.unix_seconds;
-    cg_state_t end_state;
-    cg_vec3_t pred_r;
-    cg_vec3_t pred_v;
-    int status;
-    if (horizon < -1.0e-9) {
-        return CG_ERR_RANGE;
-    }
-    if (opt->max_extrapolation_seconds > 0.0 &&
-        horizon > opt->max_extrapolation_seconds + 1.0e-9) {
-        return CG_ERR_RANGE;
-    }
-    status = cg_extrapolation_initial_state(obs, count, opt, cache, &end_state);
-    if (status != CG_OK) {
-        return status;
-    }
-    status = cg_propagate_j2(end_state.r_j2000_m, end_state.v_j2000_mps, horizon,
-                             opt->propagation_step_seconds, &pred_r, &pred_v);
-    if (status != CG_OK) {
-        return status;
-    }
-    if (opt->enable_orbit_phase_correction && horizon > 0.0) {
-        double period = cg_orbital_period_seconds(end_state.r_j2000_m, end_state.v_j2000_mps);
-        if (period > horizon + 60.0) {
-            double anchor_unix = end_state.time_utc.unix_seconds - period;
-            size_t anchor_index = cg_find_nearest_observation(obs, count, anchor_unix);
-            cg_state_t anchor_state;
-            cg_state_t target_state;
-            cg_time_t target_time;
-            cg_vec3_t past_pred_r;
-            cg_vec3_t past_pred_v;
-            double actual_horizon;
-            memset(&anchor_state, 0, sizeof(anchor_state));
-            memset(&target_state, 0, sizeof(target_state));
-            memset(&past_pred_r, 0, sizeof(past_pred_r));
-            memset(&past_pred_v, 0, sizeof(past_pred_v));
-            if (anchor_index < count - 1 &&
-                fabs(obs[anchor_index].time_utc.unix_seconds - anchor_unix) <= 180.0) {
-                target_time = cg_time_add_seconds(&obs[anchor_index].time_utc, horizon);
-                if (target_time.unix_seconds <= obs[count - 1].time_utc.unix_seconds + 1.0e-9 &&
-                    target_time.unix_seconds >= obs[0].time_utc.unix_seconds - 1.0e-9) {
-                    status = cg_direct_state_at_index(obs, count, anchor_index, opt, cache, &anchor_state);
-                    if (status == CG_OK) {
-                        status = cg_interpolate_state_cached(obs, count, &target_time, opt, cache, &target_state);
-                    }
-                    if (status == CG_OK) {
-                        actual_horizon = target_time.unix_seconds - anchor_state.time_utc.unix_seconds;
-                        status = cg_propagate_j2(anchor_state.r_j2000_m, anchor_state.v_j2000_mps,
-                                                 actual_horizon, opt->propagation_step_seconds,
-                                                 &past_pred_r, &past_pred_v);
-                    }
-                    if (status == CG_OK) {
-                        cg_vec3_t correction = cg_vec_sub(target_state.r_j2000_m, past_pred_r);
-                        pred_r = cg_vec_add(pred_r, correction);
-                    }
-                }
-            }
-        }
-    }
-    out->time_utc = *query;
-    out->r_j2000_m = pred_r;
-    out->v_j2000_mps = pred_v;
-    return CG_OK;
-}
-
 static int cg_query_state_internal(
     const cg_observation_t *obs,
     size_t count,
     const cg_time_t *query,
     const cg_options_t *opt,
     cg_fit_cache_t *main_cache,
-    cg_fit_cache_t *aux_cache,
     cg_state_t *out)
 {
     if (query->unix_seconds < obs[0].time_utc.unix_seconds - 1.0e-9) {
@@ -1395,13 +787,12 @@ static int cg_query_state_internal(
     if (query->unix_seconds <= obs[count - 1].time_utc.unix_seconds + 1.0e-9) {
         return cg_interpolate_state_cached(obs, count, query, opt, main_cache, out);
     }
-    return cg_extrapolate_future(obs, count, query, opt, aux_cache, out);
+    return CG_ERR_RANGE;
 }
 
 static void cg_context_invalidate_cache(cg_context_t *context)
 {
     memset(&context->main_cache, 0, sizeof(context->main_cache));
-    memset(&context->aux_cache, 0, sizeof(context->aux_cache));
 }
 
 static void cg_reverse_observations(cg_observation_t *obs, size_t first, size_t last)
@@ -1500,7 +891,10 @@ int cg_context_push(
     const cg_observation_t *observation)
 {
     size_t index;
-    if (!context || !context->observations || context->capacity < 2 || !observation) {
+    if (!context || !context->observations || context->capacity < 2 || !observation ||
+        !isfinite(observation->r_ecef_m.x) ||
+        !isfinite(observation->r_ecef_m.y) ||
+        !isfinite(observation->r_ecef_m.z)) {
         return CG_ERR_INVALID_ARGUMENT;
     }
     if (context->count > 0) {
@@ -1538,8 +932,7 @@ int cg_context_query_state(
 
     cg_context_linearize(context);
     return cg_query_state_internal(context->observations, context->count, query_time_utc,
-                                   &context->options, &context->main_cache,
-                                   &context->aux_cache, out_state);
+                                   &context->options, &context->main_cache, out_state);
 }
 
 const char *cg_status_string(int status)

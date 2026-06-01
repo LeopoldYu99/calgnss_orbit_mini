@@ -32,19 +32,11 @@ typedef struct cg_state_t {
 
 typedef struct cg_observation_t {
     cg_time_t time_utc;
-    double lat_deg;
-    double lon_deg;
-    double alt_m;
+    cg_vec3_t r_ecef_m;
 } cg_observation_t;
 
 typedef struct cg_options_t {
     int degree;
-    /* <= 0 means no fixed future extrapolation limit. */
-    double max_extrapolation_seconds;
-    /* <= 0 means use all cached history for future extrapolation initial-state fitting. */
-    double extrapolation_history_seconds;
-    double propagation_step_seconds;
-    int enable_orbit_phase_correction;
 } cg_options_t;
 
 #define CG_MAX_DEGREE 16
