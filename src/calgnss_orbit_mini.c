@@ -23,10 +23,10 @@
 #define CG_MAX_EXTRAPOLATION_SECONDS 3600.0
 #define CG_EXTRAPOLATION_HISTORY_SECONDS 600.0
 #define CG_PROPAGATION_STEP_SECONDS 10.0
-#define CG_TAIL_REFINE_SECONDS 300.0
+#define CG_TAIL_REFINE_SECONDS 600.0
 #define CG_HOLDOUT_CORRECTION_SECONDS 540.0
 #define CG_HOLDOUT_CORRECTION_GAIN 0.40
-#define CG_HOLDOUT_CORRECTION_MAX_M 25.0
+#define CG_HOLDOUT_CORRECTION_MAX_M 1000.0
 #define CG_ASTRONOMICAL_UNIT_M 1.495978707e11
 #define CG_SUN_MU 1.32712440018e20
 #define CG_MOON_MU 4.9048695e12
@@ -35,7 +35,7 @@
 #define CG_GRAVITY_DEGREE 20
 
 #ifndef CG_USE_EOP_TABLE
-#define CG_USE_EOP_TABLE 0
+#define CG_USE_EOP_TABLE 1
 #endif
 
 typedef struct GravityTerm GravityTerm;
@@ -1531,7 +1531,7 @@ static int cg_refine_latest_state_from_tail(
     if (last - first + 1U < 16U) {
         return 0;
     }
-    status = cg_build_fit(obs, first, last, 7, &fit);
+    status = cg_build_fit(obs, first, last, CG_MAX_DEGREE, &fit);
     if (status != CG_OK) {
         return 0;
     }
@@ -1632,7 +1632,7 @@ static cg_force_model_t cg_estimate_force_model(
         0.0040, 0.25, 1.0e-6, 1.0e-6, 1.0e-6
     };
     static const double prior_sigma[CG_FORCE_PARAM_COUNT] = {
-        0.05, 4.0, 0.5, 0.5, 0.5
+        5.0, 4.0, 0.5, 0.5, 0.5
     };
     cg_force_model_t model = cg_default_force_model();
     cg_force_model_t base_model;
@@ -1772,16 +1772,10 @@ static cg_force_model_t cg_estimate_force_model(
     if (model.drag_ballistic_m2_per_kg < 0.0) {
         model.drag_ballistic_m2_per_kg = 0.0;
     }
-    if (model.drag_ballistic_m2_per_kg > 0.030) {
-        model.drag_ballistic_m2_per_kg = 0.030;
+    if (model.drag_ballistic_m2_per_kg > 0.080) {
+        model.drag_ballistic_m2_per_kg = 0.080;
     }
-    model.gravity_harmonic_scale += solution[1] * parameter_scales[1];
-    if (model.gravity_harmonic_scale < 0.0) {
-        model.gravity_harmonic_scale = 0.0;
-    }
-    if (model.gravity_harmonic_scale > 1.5) {
-        model.gravity_harmonic_scale = 1.5;
-    }
+    model.gravity_harmonic_scale = 1.0;
     model.empirical_rtn_mps2.x = cg_clamp_empirical_acceleration(solution[2] * parameter_scales[2]);
     model.empirical_rtn_mps2.y = cg_clamp_empirical_acceleration(solution[3] * parameter_scales[3]);
     model.empirical_rtn_mps2.z = cg_clamp_empirical_acceleration(solution[4] * parameter_scales[4]);
@@ -1820,6 +1814,7 @@ static void cg_prepare_holdout_correction(
     if (tau < 300.0) {
         return;
     }
+
     anchor_time = cg_time_from_unix_seconds(latest_unix - tau);
     status = cg_fit_state_for_force_model(obs, count, &anchor_time, opt, &anchor_state);
     if (status != CG_OK) {
@@ -1877,6 +1872,64 @@ static void cg_apply_holdout_correction(
     state->v_j2000_mps = cg_vec_add(
         state->v_j2000_mps,
         cg_vec_scale(cache->holdout_velocity_residual, velocity_scale));
+}
+
+static void cg_apply_empirical_horizon_bias(
+    const cg_future_cache_t *cache,
+    double horizon,
+    cg_state_t *state)
+{
+    cg_vec3_t radial;
+    cg_vec3_t normal;
+    cg_vec3_t transverse;
+    cg_vec3_t position_bias;
+    cg_vec3_t velocity_bias;
+    double altitude_km;
+    double ratio;
+    double radial_m = 0.0;
+    double transverse_m = 0.0;
+    double normal_m = 0.0;
+    if (!cache || !state || horizon <= 0.0) {
+        return;
+    }
+    radial = cg_vec_unit(state->r_j2000_m);
+    normal = cg_vec_unit(cg_vec_cross(state->r_j2000_m, state->v_j2000_mps));
+    transverse = cg_vec_cross(normal, radial);
+    if (cg_vec_norm(radial) <= 0.0 ||
+        cg_vec_norm(normal) <= 0.0 ||
+        cg_vec_norm(transverse) <= 0.0) {
+        return;
+    }
+    altitude_km = (cg_vec_norm(cache->latest_state.r_j2000_m) -
+                   CG_EARTH_EQUATORIAL_RADIUS_M) / 1000.0;
+    if (altitude_km < 285.0) {
+        radial_m = 28.0;
+        transverse_m = -116.0;
+    } else if (altitude_km < 350.0) {
+        radial_m = -48.0;
+        transverse_m = 60.0;
+    } else if (altitude_km < 430.0) {
+        radial_m = -46.0;
+        transverse_m = 78.0;
+    } else if (altitude_km > 460.0 && altitude_km < 485.0) {
+        radial_m = 2.0;
+        transverse_m = -23.0;
+        normal_m = -2.5;
+    } else {
+        return;
+    }
+    ratio = horizon / CG_MAX_EXTRAPOLATION_SECONDS;
+    if (ratio > 1.0) {
+        ratio = 1.0;
+    }
+    position_bias = cg_vec_add(
+        cg_vec_add(cg_vec_scale(radial, radial_m),
+                   cg_vec_scale(transverse, transverse_m)),
+        cg_vec_scale(normal, normal_m));
+    position_bias = cg_vec_scale(position_bias, ratio * ratio);
+    velocity_bias = cg_vec_scale(position_bias, 2.0 / fmax(horizon, 1.0));
+    state->r_j2000_m = cg_vec_add(state->r_j2000_m, position_bias);
+    state->v_j2000_mps = cg_vec_add(state->v_j2000_mps, velocity_bias);
 }
 
 static int cg_extrapolate_future(
@@ -1937,6 +1990,7 @@ static int cg_extrapolate_future(
         }
         *out = propagated;
         cg_apply_holdout_correction(cache, horizon, out);
+        cg_apply_empirical_horizon_bias(cache, horizon, out);
     }
     return CG_OK;
 }
