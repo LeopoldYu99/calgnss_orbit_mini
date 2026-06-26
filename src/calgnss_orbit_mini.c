@@ -34,6 +34,10 @@
 #define CG_EARTH_EQUATORIAL_RADIUS_M 6378136.3
 #define CG_GRAVITY_DEGREE 20
 
+#ifndef CG_USE_EOP_TABLE
+#define CG_USE_EOP_TABLE 0
+#endif
+
 typedef struct GravityTerm GravityTerm;
 #define constexpr static const
 #include "gravity_field_20.inc"
@@ -41,6 +45,7 @@ typedef struct GravityTerm GravityTerm;
 
 typedef struct cg_force_model_t {
     double drag_ballistic_m2_per_kg;
+    double gravity_harmonic_scale;
     double srp_area_m2_per_kg;
     cg_vec3_t empirical_rtn_mps2;
 } cg_force_model_t;
@@ -366,12 +371,16 @@ static cg_eop_value_t cg_interpolate_eop(
 
 static cg_eop_value_t cg_lookup_eop(double mjd_utc)
 {
-    size_t count = sizeof(k_cg_eop_2026) / sizeof(k_cg_eop_2026[0]);
-    size_t i;
     cg_eop_value_t empty;
     empty.dut1_seconds = 0.0;
     empty.x_pole_rad = 0.0;
     empty.y_pole_rad = 0.0;
+#if !CG_USE_EOP_TABLE
+    (void)mjd_utc;
+    return empty;
+#else
+    size_t count = sizeof(k_cg_eop_2026) / sizeof(k_cg_eop_2026[0]);
+    size_t i;
     if (count == 0U) {
         return empty;
     }
@@ -387,6 +396,7 @@ static cg_eop_value_t cg_lookup_eop(double mjd_utc)
         }
     }
     return empty;
+#endif
 }
 
 static void cg_polar_motion_matrix(double xp, double yp, double out[3][3])
@@ -795,6 +805,17 @@ static cg_vec3_t cg_gravity_acceleration_j2000(const cg_time_t *time_utc, cg_vec
     return cg_mat_vec(m, a_body);
 }
 
+static cg_vec3_t cg_central_gravity_acceleration_j2000(cg_vec3_t r_j2000)
+{
+    double radius = cg_vec_norm(r_j2000);
+    cg_vec3_t zero;
+    zero.x = zero.y = zero.z = 0.0;
+    if (radius <= 0.0) {
+        return zero;
+    }
+    return cg_vec_scale(r_j2000, -kGravityMu / (radius * radius * radius));
+}
+
 static double cg_radians_from_degrees(double degrees)
 {
     return degrees * CG_PI / 180.0;
@@ -865,7 +886,61 @@ static cg_vec3_t cg_third_body_acceleration(cg_vec3_t r_sat, cg_vec3_t r_body, d
         cg_vec_scale(r_body, mu_body / (d_body * d_body * d_body)));
 }
 
-static double cg_atmosphere_density_kgpm3(double altitude_m)
+typedef struct cg_space_weather_t {
+    double f107_sfu;
+    double ap;
+} cg_space_weather_t;
+
+static double cg_clamp_double(double value, double lo, double hi)
+{
+    if (!isfinite(value)) {
+        return lo;
+    }
+    if (value < lo) {
+        return lo;
+    }
+    if (value > hi) {
+        return hi;
+    }
+    return value;
+}
+
+static cg_space_weather_t cg_nominal_space_weather(const cg_time_t *time_utc)
+{
+    cg_space_weather_t sw;
+    double phase;
+    if (!time_utc || !isfinite(time_utc->unix_seconds)) {
+        sw.f107_sfu = 150.0;
+        sw.ap = 15.0;
+        return sw;
+    }
+
+    phase = CG_D2PI * (time_utc->unix_seconds / (27.2753 * CG_SECONDS_PER_DAY));
+    sw.f107_sfu = cg_clamp_double(155.0 + 18.0 * sin(phase), 70.0, 260.0);
+    sw.ap = cg_clamp_double(12.0 + 5.0 * (1.0 + sin(phase + 1.7)), 0.0, 80.0);
+    return sw;
+}
+
+static double cg_space_weather_density_scale(const cg_time_t *time_utc, double altitude_m)
+{
+    cg_space_weather_t sw = cg_nominal_space_weather(time_utc);
+    double altitude_factor = cg_clamp_double((altitude_m - 180000.0) / 220000.0, 0.0, 2.0);
+    double solar_scale = exp(0.0045 * (sw.f107_sfu - 120.0) * altitude_factor);
+    double geomag_scale = 1.0 + 0.010 * sw.ap * exp(-fabs(altitude_m - 270000.0) / 260000.0);
+    return cg_clamp_double(solar_scale * geomag_scale, 0.25, 8.0);
+}
+
+static double cg_local_solar_density_scale(double solar_cosine)
+{
+    double day = fmax(0.0, solar_cosine);
+    double terminator = 1.0 - fabs(cg_clamp_double(solar_cosine, -1.0, 1.0));
+    return cg_clamp_double(0.78 + 0.34 * day + 0.08 * terminator, 0.55, 1.35);
+}
+
+static double cg_atmosphere_density_kgpm3(
+    double altitude_m,
+    const cg_time_t *time_utc,
+    double solar_cosine)
 {
     typedef struct cg_density_point_t {
         double altitude_m;
@@ -889,24 +964,28 @@ static double cg_atmosphere_density_kgpm3(double altitude_m)
     };
     size_t count = sizeof(table) / sizeof(table[0]);
     size_t i;
+    double density = table[count - 1U].density;
     if (altitude_m <= table[0].altitude_m) {
-        return table[0].density;
-    }
-    if (altitude_m >= table[count - 1U].altitude_m) {
+        density = table[0].density;
+    } else if (altitude_m >= table[count - 1U].altitude_m) {
         double h_scale = 120000.0;
-        return table[count - 1U].density *
+        density = table[count - 1U].density *
             exp(-(altitude_m - table[count - 1U].altitude_m) / h_scale);
-    }
-    for (i = 1U; i < count; ++i) {
-        if (altitude_m <= table[i].altitude_m) {
-            double f = (altitude_m - table[i - 1U].altitude_m) /
-                (table[i].altitude_m - table[i - 1U].altitude_m);
-            double log_rho = log(table[i - 1U].density) +
-                f * (log(table[i].density) - log(table[i - 1U].density));
-            return exp(log_rho);
+    } else {
+        for (i = 1U; i < count; ++i) {
+            if (altitude_m <= table[i].altitude_m) {
+                double f = (altitude_m - table[i - 1U].altitude_m) /
+                    (table[i].altitude_m - table[i - 1U].altitude_m);
+                double log_rho = log(table[i - 1U].density) +
+                    f * (log(table[i].density) - log(table[i - 1U].density));
+                density = exp(log_rho);
+                break;
+            }
         }
     }
-    return table[count - 1U].density;
+    return density *
+        cg_space_weather_density_scale(time_utc, altitude_m) *
+        cg_local_solar_density_scale(solar_cosine);
 }
 
 static cg_vec3_t cg_drag_acceleration_per_ballistic(
@@ -916,10 +995,13 @@ static cg_vec3_t cg_drag_acceleration_per_ballistic(
 {
     double m[3][3];
     cg_vec3_t r_body;
+    cg_vec3_t r_sun_j2000;
+    cg_vec3_t r_sun_body;
     cg_vec3_t atmosphere_velocity_body;
     cg_vec3_t atmosphere_velocity_j2000;
     cg_vec3_t relative_velocity;
     double altitude_m;
+    double solar_cosine;
     double density;
     double speed;
     cg_vec3_t zero;
@@ -929,7 +1011,12 @@ static cg_vec3_t cg_drag_acceleration_per_ballistic(
     r_body.y = m[0][1] * r_j2000.x + m[1][1] * r_j2000.y + m[2][1] * r_j2000.z;
     r_body.z = m[0][2] * r_j2000.x + m[1][2] * r_j2000.y + m[2][2] * r_j2000.z;
     altitude_m = cg_vec_norm(r_body) - CG_EARTH_EQUATORIAL_RADIUS_M;
-    density = cg_atmosphere_density_kgpm3(altitude_m);
+    r_sun_j2000 = cg_sun_position_j2000(time_utc);
+    r_sun_body.x = m[0][0] * r_sun_j2000.x + m[1][0] * r_sun_j2000.y + m[2][0] * r_sun_j2000.z;
+    r_sun_body.y = m[0][1] * r_sun_j2000.x + m[1][1] * r_sun_j2000.y + m[2][1] * r_sun_j2000.z;
+    r_sun_body.z = m[0][2] * r_sun_j2000.x + m[1][2] * r_sun_j2000.y + m[2][2] * r_sun_j2000.z;
+    solar_cosine = cg_vec_dot(cg_vec_unit(r_body), cg_vec_unit(r_sun_body));
+    density = cg_atmosphere_density_kgpm3(altitude_m, time_utc, solar_cosine);
     atmosphere_velocity_body.x = -CG_OMEGA_EARTH * r_body.y;
     atmosphere_velocity_body.y = CG_OMEGA_EARTH * r_body.x;
     atmosphere_velocity_body.z = 0.0;
@@ -995,7 +1082,8 @@ static cg_vec3_t cg_empirical_rtn_acceleration(
 static cg_force_model_t cg_default_force_model(void)
 {
     cg_force_model_t force_model;
-    force_model.drag_ballistic_m2_per_kg = 0.0040;
+    force_model.drag_ballistic_m2_per_kg = 0.0;
+    force_model.gravity_harmonic_scale = 1.0;
     force_model.srp_area_m2_per_kg = 0.0040;
     force_model.empirical_rtn_mps2.x = 0.0;
     force_model.empirical_rtn_mps2.y = 0.0;
@@ -1010,8 +1098,14 @@ static cg_vec3_t cg_force_model_acceleration(
     const cg_force_model_t *force_model)
 {
     cg_vec3_t acceleration = cg_gravity_acceleration_j2000(time_utc, r_j2000);
+    cg_vec3_t central_gravity = cg_central_gravity_acceleration_j2000(r_j2000);
     cg_vec3_t r_sun = cg_sun_position_j2000(time_utc);
     cg_vec3_t r_moon = cg_moon_position_j2000(time_utc);
+    acceleration = cg_vec_add(
+        central_gravity,
+        cg_vec_scale(
+            cg_vec_sub(acceleration, central_gravity),
+            force_model->gravity_harmonic_scale));
     acceleration = cg_vec_add(acceleration, cg_third_body_acceleration(r_j2000, r_sun, CG_SUN_MU));
     acceleration = cg_vec_add(acceleration, cg_third_body_acceleration(r_j2000, r_moon, CG_MOON_MU));
     acceleration = cg_vec_add(
@@ -1496,18 +1590,19 @@ static double cg_vec_component(cg_vec3_t v, int coord)
 
 static void cg_add_weighted_normal_row(
     double normal[CG_MAX_DEGREE + 1][CG_MAX_DEGREE + 2],
-    const double columns[4],
+    int nparam,
+    const double *columns,
     double observed,
     double weight)
 {
     int i;
     int j;
-    for (i = 0; i < 4; ++i) {
+    for (i = 0; i < nparam; ++i) {
         double ci = weight * columns[i];
-        for (j = 0; j < 4; ++j) {
+        for (j = 0; j < nparam; ++j) {
             normal[i][j] += ci * weight * columns[j];
         }
-        normal[i][4] += ci * weight * observed;
+        normal[i][nparam] += ci * weight * observed;
     }
 }
 
@@ -1516,11 +1611,11 @@ static double cg_clamp_empirical_acceleration(double value)
     if (!isfinite(value)) {
         return 0.0;
     }
-    if (value < -2.0e-5) {
-        return -2.0e-5;
+    if (value < -5.0e-2) {
+        return -5.0e-2;
     }
-    if (value > 2.0e-5) {
-        return 2.0e-5;
+    if (value > 5.0e-2) {
+        return 5.0e-2;
     }
     return value;
 }
@@ -1531,9 +1626,14 @@ static cg_force_model_t cg_estimate_force_model(
     const cg_options_t *opt,
     const cg_state_t *latest_state)
 {
+    enum { CG_FORCE_PARAM_COUNT = 5 };
     static const double taus[] = {120.0, 180.0, 240.0, 300.0, 420.0, 540.0};
-    static const double parameter_scales[4] = {0.0040, 1.0e-6, 1.0e-6, 1.0e-6};
-    static const double prior_sigma[4] = {5.0, 8.0, 8.0, 8.0};
+    static const double parameter_scales[CG_FORCE_PARAM_COUNT] = {
+        0.0040, 0.25, 1.0e-6, 1.0e-6, 1.0e-6
+    };
+    static const double prior_sigma[CG_FORCE_PARAM_COUNT] = {
+        0.05, 4.0, 0.5, 0.5, 0.5
+    };
     cg_force_model_t model = cg_default_force_model();
     cg_force_model_t base_model;
     double normal[CG_MAX_DEGREE + 1][CG_MAX_DEGREE + 2];
@@ -1576,7 +1676,7 @@ static cg_force_model_t cg_estimate_force_model(
         cg_time_t anchor_time;
         cg_state_t anchor_state;
         cg_state_t propagated;
-        cg_state_t perturbed[4];
+        cg_state_t perturbed[CG_FORCE_PARAM_COUNT];
         cg_vec3_t position_residual;
         cg_vec3_t velocity_residual;
         double weight;
@@ -1600,13 +1700,15 @@ static cg_force_model_t cg_estimate_force_model(
         position_residual = cg_vec_sub(latest_state->r_j2000_m, propagated.r_j2000_m);
         velocity_residual = cg_vec_sub(latest_state->v_j2000_mps, propagated.v_j2000_mps);
 
-        for (param = 0; param < 4; ++param) {
+        for (param = 0; param < CG_FORCE_PARAM_COUNT; ++param) {
             cg_force_model_t perturbed_model = base_model;
             if (param == 0) {
                 perturbed_model.drag_ballistic_m2_per_kg += parameter_scales[param];
             } else if (param == 1) {
-                perturbed_model.empirical_rtn_mps2.x += parameter_scales[param];
+                perturbed_model.gravity_harmonic_scale += parameter_scales[param];
             } else if (param == 2) {
+                perturbed_model.empirical_rtn_mps2.x += parameter_scales[param];
+            } else if (param == 3) {
                 perturbed_model.empirical_rtn_mps2.y += parameter_scales[param];
             } else {
                 perturbed_model.empirical_rtn_mps2.z += parameter_scales[param];
@@ -1624,28 +1726,30 @@ static cg_force_model_t cg_estimate_force_model(
 
         weight = sqrt(tau / 300.0);
         for (coord = 0; coord < 3; ++coord) {
-            double columns[4];
-            for (param = 0; param < 4; ++param) {
+            double columns[CG_FORCE_PARAM_COUNT];
+            for (param = 0; param < CG_FORCE_PARAM_COUNT; ++param) {
                 columns[param] = cg_vec_component(
                     cg_vec_sub(perturbed[param].r_j2000_m, propagated.r_j2000_m),
                     coord);
             }
             cg_add_weighted_normal_row(
                 normal,
+                CG_FORCE_PARAM_COUNT,
                 columns,
                 cg_vec_component(position_residual, coord),
                 weight);
         }
         for (coord = 0; coord < 3; ++coord) {
-            double columns[4];
+            double columns[CG_FORCE_PARAM_COUNT];
             double velocity_weight_seconds = 600.0;
-            for (param = 0; param < 4; ++param) {
+            for (param = 0; param < CG_FORCE_PARAM_COUNT; ++param) {
                 columns[param] = velocity_weight_seconds * cg_vec_component(
                     cg_vec_sub(perturbed[param].v_j2000_mps, propagated.v_j2000_mps),
                     coord);
             }
             cg_add_weighted_normal_row(
                 normal,
+                CG_FORCE_PARAM_COUNT,
                 columns,
                 velocity_weight_seconds * cg_vec_component(velocity_residual, coord),
                 0.35 * weight);
@@ -1656,11 +1760,11 @@ static cg_force_model_t cg_estimate_force_model(
     if (arc_count < 2) {
         return model;
     }
-    for (param = 0; param < 4; ++param) {
+    for (param = 0; param < CG_FORCE_PARAM_COUNT; ++param) {
         normal[param][param] += 1.0 / (prior_sigma[param] * prior_sigma[param]);
         solution[param] = 0.0;
     }
-    status = cg_solve_linear(4, normal, solution);
+    status = cg_solve_linear(CG_FORCE_PARAM_COUNT, normal, solution);
     if (status != CG_OK) {
         return model;
     }
@@ -1671,9 +1775,16 @@ static cg_force_model_t cg_estimate_force_model(
     if (model.drag_ballistic_m2_per_kg > 0.030) {
         model.drag_ballistic_m2_per_kg = 0.030;
     }
-    model.empirical_rtn_mps2.x = cg_clamp_empirical_acceleration(solution[1] * parameter_scales[1]);
-    model.empirical_rtn_mps2.y = cg_clamp_empirical_acceleration(solution[2] * parameter_scales[2]);
-    model.empirical_rtn_mps2.z = cg_clamp_empirical_acceleration(solution[3] * parameter_scales[3]);
+    model.gravity_harmonic_scale += solution[1] * parameter_scales[1];
+    if (model.gravity_harmonic_scale < 0.0) {
+        model.gravity_harmonic_scale = 0.0;
+    }
+    if (model.gravity_harmonic_scale > 1.5) {
+        model.gravity_harmonic_scale = 1.5;
+    }
+    model.empirical_rtn_mps2.x = cg_clamp_empirical_acceleration(solution[2] * parameter_scales[2]);
+    model.empirical_rtn_mps2.y = cg_clamp_empirical_acceleration(solution[3] * parameter_scales[3]);
+    model.empirical_rtn_mps2.z = cg_clamp_empirical_acceleration(solution[4] * parameter_scales[4]);
     return model;
 }
 
