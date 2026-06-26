@@ -1,6 +1,6 @@
 # calgnss_orbit_mini
 
-`calgnss_orbit_mini` 是一个面向嵌入式/跨平台集成的 C 语言小型轨道拟合库。库接收按时间递增的 ECEF/ITRS 位置观测数据，在内部维护一段可配置长度的环形缓存，并根据用户查询时间输出 J2000 惯性坐标系下的位置和速度状态量。
+`calgnss_orbit_mini` 是一个面向嵌入式/跨平台集成的 C 语言小型轨道拟合库。库接收按时间递增的 ECEF/ITRS 位置观测数据，在内部维护一段可配置长度的环形缓存，并根据用户查询时间输出 J2000 惯性坐标系下的位置和速度状态量。查询时间位于观测范围内时执行插值拟合，位于最新观测之后时支持短期未来轨道外推。
 
 ## 设计目标
 
@@ -83,17 +83,18 @@ typedef struct cg_state_t {
 输出能力：
 
 - 查询时间位于已有观测时间范围内时，输出该时刻的 J2000 状态量。查询时间可以不是原始输入数据中的时间点，支持毫秒级时间输入和插值拟合。
-- 查询时间晚于最新观测时间时返回 `CG_ERR_RANGE`；mini 版本不做未来轨道外推。
+- 查询时间晚于最新观测时间时，支持最长 3600 s 的短期未来轨道外推；超过最大外推时长时返回 `CG_ERR_RANGE`。
 
 目标精度：
 
 - 观测时间范围内插值：定位精度目标 `< 10 m`，测速精度目标 `< 0.2 m/s`。
+- 最新观测后的短期外推：精度取决于观测弧长、观测质量、缺测情况、轨道环境和外推时长，建议在目标场景中用实测数据验证。
 
 精度前提：
 
 - 输入 ECEF 观测本身的时间和坐标误差满足目标精度要求。
 - 缓存中有足够连续、覆盖合理的观测数据。
-- 查询时间必须落在缓存观测时间范围内。
+- 查询时间必须落在缓存观测时间范围内，或不超过最新观测后 3600 s。
 
 ## 处理流程
 
@@ -103,7 +104,8 @@ typedef struct cg_state_t {
 4. 库内部以环形缓存保存最近 `N` 组观测。
 5. 调用 `cg_context_query_state()` 查询任意支持时间点的状态量。
 6. 查询时间在观测范围内时，使用局部 Chebyshev 最小二乘拟合计算位置和速度。
-7. 查询时间超出观测范围时返回 `CG_ERR_RANGE`。
+7. 查询时间晚于最新观测且不超过 3600 s 时，基于末端观测拟合最新 J2000 状态，并使用简化动力学模型进行数值积分外推。
+8. 查询时间早于缓存最早观测，或超过最大未来外推时长时返回 `CG_ERR_RANGE`。
 
 ## 使用条件
 
@@ -118,8 +120,9 @@ typedef struct cg_state_t {
 
 - 至少输入 2 组观测后才能查询。
 - 观测时间必须严格递增；重复时间或倒序输入会返回 `CG_ERR_RANGE`。
-- 查询时间早于缓存最早观测时间或晚于最新观测时间会返回 `CG_ERR_RANGE`。
+- 查询时间早于缓存最早观测时间，或晚于最新观测后 3600 s 会返回 `CG_ERR_RANGE`。
 - 缺测时间越长，拟合窗口内可用数据越少，插值精度越容易下降。
+- 外推会优先使用最新观测前约 600 s 的历史数据估计末端状态和经验力模型；有效历史弧段越短、缺测越多，外推结果越需要谨慎使用。
 
 ### 缓存长度 `N`
 
@@ -162,7 +165,7 @@ typedef struct cg_options_t {
 | --- | --- |
 | `CG_OK` | 成功。 |
 | `CG_ERR_INVALID_ARGUMENT` | 输入指针为空、容量不足、数据量不足等非法参数。 |
-| `CG_ERR_RANGE` | 时间范围不支持，例如倒序输入、查询早于缓存或查询晚于最新观测。 |
+| `CG_ERR_RANGE` | 时间范围不支持，例如倒序输入、查询早于缓存或查询超过最大未来外推时长。 |
 | `CG_ERR_FIT` | 拟合失败，常见原因是数据量不足或几何条件差。 |
 | `CG_ERR_NO_MEMORY` | 创建上下文时内存分配失败。 |
 | `CG_ERR_PARSE` / `CG_ERR_IO` | 预留错误码，核心库当前不执行解析和 I/O。 |
@@ -171,7 +174,7 @@ typedef struct cg_options_t {
 
 ## 使用 Demo
 
-下面 demo 展示纯内存调用流程：构造时间、创建环形缓存、写入观测、查询毫秒级插值点。示例中的 ECEF 数据只用于演示 API，不代表真实轨道数据。
+下面 demo 展示纯内存调用流程：构造时间、创建环形缓存、写入观测、查询毫秒级插值点和短期未来外推点。示例中的 ECEF 数据只用于演示 API，不代表真实轨道数据。
 
 ```c
 #include "calgnss_orbit_mini.h"
@@ -299,6 +302,7 @@ int main(void)
     cg_options_t opt;
     cg_time_t t0;
     cg_time_t query_interp;
+    cg_time_t query_future;
     cg_state_t state;
     int status;
     int i;
@@ -338,6 +342,17 @@ int main(void)
                state.v_j2000_mps.x, state.v_j2000_mps.y, state.v_j2000_mps.z);
     } else {
         printf("interpolation query failed: %s\n", cg_status_string(status));
+    }
+
+    query_future = demo_add_seconds(&t0, 599.0 + 120.0);
+    status = cg_context_query_state(ctx, &query_future, &state);
+    if (status == CG_OK) {
+        printf("extrapolation J2000 r = %.3f %.3f %.3f m\n",
+               state.r_j2000_m.x, state.r_j2000_m.y, state.r_j2000_m.z);
+        printf("extrapolation J2000 v = %.6f %.6f %.6f m/s\n",
+               state.v_j2000_mps.x, state.v_j2000_mps.y, state.v_j2000_mps.z);
+    } else {
+        printf("extrapolation query failed: %s\n", cg_status_string(status));
     }
 
     cg_context_destroy(ctx);
@@ -390,4 +405,4 @@ const char *cg_status_string(int status);
 - ECEF/ITRS 转换到 J2000/GCRS，内部使用紧凑的 IAU 2000B 章动/岁差、UT1-UTC、极移和格林尼治视恒星时模型。
 - 库内置 2026 年 EOP 日表；表内按 MJD 线性插值，表外使用最近端点值。
 - 观测范围内查询使用局部 Chebyshev 最小二乘位置拟合，速度由拟合多项式解析求导得到。
-- 未来查询不做轨道外推，直接返回 `CG_ERR_RANGE`。
+- 未来查询在最新观测后 3600 s 内使用末端状态估计、简化力模型和 RK4 数值积分进行短期外推；超过该范围返回 `CG_ERR_RANGE`。

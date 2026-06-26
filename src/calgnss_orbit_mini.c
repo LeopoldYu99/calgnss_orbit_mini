@@ -2,6 +2,7 @@
 
 #include <float.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -19,6 +20,30 @@
 
 #define CG_OMEGA_EARTH 7.2921150e-5
 #define CG_FIT_WINDOW_SECONDS 300.0
+#define CG_MAX_EXTRAPOLATION_SECONDS 3600.0
+#define CG_EXTRAPOLATION_HISTORY_SECONDS 600.0
+#define CG_PROPAGATION_STEP_SECONDS 10.0
+#define CG_TAIL_REFINE_SECONDS 300.0
+#define CG_HOLDOUT_CORRECTION_SECONDS 540.0
+#define CG_HOLDOUT_CORRECTION_GAIN 0.40
+#define CG_HOLDOUT_CORRECTION_MAX_M 25.0
+#define CG_ASTRONOMICAL_UNIT_M 1.495978707e11
+#define CG_SUN_MU 1.32712440018e20
+#define CG_MOON_MU 4.9048695e12
+#define CG_SOLAR_RADIATION_PRESSURE 4.56e-6
+#define CG_EARTH_EQUATORIAL_RADIUS_M 6378136.3
+#define CG_GRAVITY_DEGREE 20
+
+typedef struct GravityTerm GravityTerm;
+#define constexpr static const
+#include "gravity_field_20.inc"
+#undef constexpr
+
+typedef struct cg_force_model_t {
+    double drag_ballistic_m2_per_kg;
+    double srp_area_m2_per_kg;
+    cg_vec3_t empirical_rtn_mps2;
+} cg_force_model_t;
 
 typedef struct cg_fit_t {
     int degree;
@@ -37,6 +62,18 @@ typedef struct cg_fit_cache_t {
     cg_fit_t fit;
 } cg_fit_cache_t;
 
+typedef struct cg_future_cache_t {
+    int valid;
+    int holdout_valid;
+    double latest_unix_seconds;
+    double holdout_tau_seconds;
+    cg_force_model_t force_model;
+    cg_state_t latest_state;
+    cg_state_t last_state;
+    cg_vec3_t holdout_position_residual;
+    cg_vec3_t holdout_velocity_residual;
+} cg_future_cache_t;
+
 struct cg_context_t {
     cg_observation_t *observations;
     size_t capacity;
@@ -44,6 +81,7 @@ struct cg_context_t {
     size_t start;
     cg_options_t options;
     cg_fit_cache_t main_cache;
+    cg_future_cache_t future_cache;
 };
 
 typedef struct cg_eop_record_t {
@@ -68,6 +106,54 @@ static cg_vec3_t cg_vec_add(cg_vec3_t a, cg_vec3_t b)
     r.y = a.y + b.y;
     r.z = a.z + b.z;
     return r;
+}
+
+static cg_vec3_t cg_vec_sub(cg_vec3_t a, cg_vec3_t b)
+{
+    cg_vec3_t r;
+    r.x = a.x - b.x;
+    r.y = a.y - b.y;
+    r.z = a.z - b.z;
+    return r;
+}
+
+static cg_vec3_t cg_vec_scale(cg_vec3_t v, double scale)
+{
+    cg_vec3_t r;
+    r.x = v.x * scale;
+    r.y = v.y * scale;
+    r.z = v.z * scale;
+    return r;
+}
+
+static double cg_vec_dot(cg_vec3_t a, cg_vec3_t b)
+{
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static double cg_vec_norm(cg_vec3_t v)
+{
+    return sqrt(cg_vec_dot(v, v));
+}
+
+static cg_vec3_t cg_vec_cross(cg_vec3_t a, cg_vec3_t b)
+{
+    cg_vec3_t r;
+    r.x = a.y * b.z - a.z * b.y;
+    r.y = a.z * b.x - a.x * b.z;
+    r.z = a.x * b.y - a.y * b.x;
+    return r;
+}
+
+static cg_vec3_t cg_vec_unit(cg_vec3_t v)
+{
+    double n = cg_vec_norm(v);
+    cg_vec3_t zero;
+    zero.x = zero.y = zero.z = 0.0;
+    if (n <= 0.0 || !isfinite(n)) {
+        return zero;
+    }
+    return cg_vec_scale(v, 1.0 / n);
 }
 
 static double cg_anp(double angle)
@@ -167,6 +253,92 @@ static void cg_rz_vector_matrix(double angle, double r[3][3])
 static double cg_mjd_from_jd(double jd)
 {
     return jd - 2400000.5;
+}
+
+static int64_t cg_days_from_civil(int y, unsigned m, unsigned d)
+{
+    int era;
+    unsigned yoe;
+    unsigned doy;
+    unsigned doe;
+    int mp;
+    y -= (m <= 2U);
+    era = (y >= 0 ? y : y - 399) / 400;
+    yoe = (unsigned)(y - era * 400);
+    mp = (int)m + ((m > 2U) ? -3 : 9);
+    doy = (unsigned)((153 * mp + 2) / 5) + d - 1U;
+    doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+    return (int64_t)era * 146097 + (int64_t)doe - 719468;
+}
+
+static void cg_civil_from_days(int64_t z, int *y, unsigned *m, unsigned *d)
+{
+    int era;
+    unsigned doe;
+    unsigned yoe;
+    unsigned doy;
+    unsigned mp;
+    z += 719468;
+    era = (int)((z >= 0 ? z : z - 146096) / 146097);
+    doe = (unsigned)(z - (int64_t)era * 146097);
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    *y = (int)yoe + era * 400;
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    mp = (5 * doy + 2) / 153;
+    *d = doy - (153 * mp + 2) / 5 + 1;
+    *m = mp + (mp < 10 ? 3U : (unsigned)-9);
+    *y += (*m <= 2U);
+}
+
+static double cg_jd_from_calendar(int y, int m, int d, int hour, int minute, double second)
+{
+    int yy = y;
+    int mm = m;
+    int a;
+    int b;
+    double day;
+    if (mm <= 2) {
+        yy -= 1;
+        mm += 12;
+    }
+    a = yy / 100;
+    b = 2 - a + a / 4;
+    day = (double)d + ((double)hour + ((double)minute + second / 60.0) / 60.0) / 24.0;
+    return floor(365.25 * (double)(yy + 4716)) +
+           floor(30.6001 * (double)(mm + 1)) +
+           day + (double)b - 1524.5;
+}
+
+static cg_time_t cg_time_from_unix_seconds(double unix_seconds)
+{
+    double days_double = floor(unix_seconds / CG_SECONDS_PER_DAY);
+    int64_t days = (int64_t)days_double;
+    double seconds_of_day = unix_seconds - (double)days * CG_SECONDS_PER_DAY;
+    int year;
+    unsigned month;
+    unsigned day;
+    int whole_seconds;
+    double frac;
+    cg_time_t time;
+    if (seconds_of_day < 0.0) {
+        seconds_of_day += CG_SECONDS_PER_DAY;
+        --days;
+    }
+
+    cg_civil_from_days(days, &year, &month, &day);
+    whole_seconds = (int)floor(seconds_of_day);
+    frac = seconds_of_day - (double)whole_seconds;
+    memset(&time, 0, sizeof(time));
+    time.year = year;
+    time.month = (int)month;
+    time.day = (int)day;
+    time.hour = whole_seconds / 3600;
+    time.minute = (whole_seconds % 3600) / 60;
+    time.second = (double)(whole_seconds % 60) + frac;
+    time.unix_seconds = unix_seconds;
+    time.jd_utc = cg_jd_from_calendar(
+        time.year, time.month, time.day, time.hour, time.minute, time.second);
+    return time;
 }
 
 static cg_eop_value_t cg_eop_from_record(const cg_eop_record_t *record)
@@ -494,6 +666,456 @@ static cg_vec3_t cg_observation_to_j2000_position(const cg_observation_t *observ
     return r_j2000;
 }
 
+static double cg_normalization_factor(int n, int m)
+{
+    double factor = (double)(2 * n + 1);
+    int k;
+    if (m > 0) {
+        factor *= 2.0;
+    }
+    for (k = n - m + 1; k <= n + m; ++k) {
+        factor /= (double)k;
+    }
+    return sqrt(factor);
+}
+
+static void cg_normalized_legendre(
+    double s,
+    double pbar[CG_GRAVITY_DEGREE + 1][CG_GRAVITY_DEGREE + 1],
+    double dpbar[CG_GRAVITY_DEGREE + 1][CG_GRAVITY_DEGREE + 1])
+{
+    double p[CG_GRAVITY_DEGREE + 1][CG_GRAVITY_DEGREE + 1];
+    double u = sqrt(fmax(0.0, 1.0 - s * s));
+    double denom = s * s - 1.0;
+    int n;
+    int m;
+    memset(pbar, 0, sizeof(double) * (CG_GRAVITY_DEGREE + 1) * (CG_GRAVITY_DEGREE + 1));
+    memset(dpbar, 0, sizeof(double) * (CG_GRAVITY_DEGREE + 1) * (CG_GRAVITY_DEGREE + 1));
+    memset(p, 0, sizeof(p));
+    p[0][0] = 1.0;
+    for (m = 1; m <= CG_GRAVITY_DEGREE; ++m) {
+        p[m][m] = (double)(2 * m - 1) * u * p[m - 1][m - 1];
+    }
+    for (m = 0; m < CG_GRAVITY_DEGREE; ++m) {
+        p[m + 1][m] = (double)(2 * m + 1) * s * p[m][m];
+    }
+    for (m = 0; m <= CG_GRAVITY_DEGREE; ++m) {
+        for (n = m + 2; n <= CG_GRAVITY_DEGREE; ++n) {
+            p[n][m] =
+                ((double)(2 * n - 1) * s * p[n - 1][m] -
+                 (double)(n + m - 1) * p[n - 2][m]) /
+                (double)(n - m);
+        }
+    }
+
+    for (n = 0; n <= CG_GRAVITY_DEGREE; ++n) {
+        for (m = 0; m <= n; ++m) {
+            double norm = cg_normalization_factor(n, m);
+            double p_prev;
+            double dp;
+            pbar[n][m] = norm * p[n][m];
+            if (n == 0 || fabs(denom) < 1.0e-14) {
+                dpbar[n][m] = 0.0;
+                continue;
+            }
+            p_prev = n > m ? p[n - 1][m] : 0.0;
+            dp = ((double)n * s * p[n][m] - (double)(n + m) * p_prev) / denom;
+            dpbar[n][m] = norm * dp;
+        }
+    }
+}
+
+static cg_vec3_t cg_gravity_acceleration_body_fixed(cg_vec3_t r)
+{
+    double radius = cg_vec_norm(r);
+    cg_vec3_t acceleration;
+    if (radius <= 0.0) {
+        acceleration.x = acceleration.y = acceleration.z = 0.0;
+        return acceleration;
+    }
+    {
+        double radius2 = radius * radius;
+        double rho2 = r.x * r.x + r.y * r.y;
+        double s = r.z / radius;
+        double lambda = atan2(r.y, r.x);
+        double pbar[CG_GRAVITY_DEGREE + 1][CG_GRAVITY_DEGREE + 1];
+        double dpbar[CG_GRAVITY_DEGREE + 1][CG_GRAVITY_DEGREE + 1];
+        double radial_power[CG_GRAVITY_DEGREE + 1];
+        double radius_ratio = kGravityRadiusM / radius;
+        double d_dr = 0.0;
+        double d_ds = 0.0;
+        double d_dlambda = 0.0;
+        size_t term_index;
+        int n;
+
+        acceleration.x = -kGravityMu * r.x / (radius2 * radius);
+        acceleration.y = -kGravityMu * r.y / (radius2 * radius);
+        acceleration.z = -kGravityMu * r.z / (radius2 * radius);
+        cg_normalized_legendre(s, pbar, dpbar);
+        radial_power[0] = 1.0;
+        for (n = 1; n <= CG_GRAVITY_DEGREE; ++n) {
+            radial_power[n] = radial_power[n - 1] * radius_ratio;
+        }
+        for (term_index = 0; term_index < sizeof(kGravityTerms) / sizeof(kGravityTerms[0]); ++term_index) {
+            const GravityTerm *term = &kGravityTerms[term_index];
+            double angle = (double)term->m * lambda;
+            double cos_angle = cos(angle);
+            double sin_angle = sin(angle);
+            double harmonic = term->c * cos_angle + term->s * sin_angle;
+            double harmonic_lambda =
+                (double)term->m * (-term->c * sin_angle + term->s * cos_angle);
+            double q = radial_power[term->n];
+            double p = pbar[term->n][term->m];
+            d_dr += -kGravityMu / radius2 * (double)(term->n + 1) * q * p * harmonic;
+            d_ds += kGravityMu / radius * q * dpbar[term->n][term->m] * harmonic;
+            d_dlambda += kGravityMu / radius * q * p * harmonic_lambda;
+        }
+
+        acceleration.x += d_dr * r.x / radius + d_ds * (-s * r.x / radius2);
+        acceleration.y += d_dr * r.y / radius + d_ds * (-s * r.y / radius2);
+        acceleration.z += d_dr * r.z / radius + d_ds * ((1.0 - s * s) / radius);
+        if (rho2 > 0.0) {
+            acceleration.x += d_dlambda * (-r.y / rho2);
+            acceleration.y += d_dlambda * (r.x / rho2);
+        }
+    }
+    return acceleration;
+}
+
+static cg_vec3_t cg_gravity_acceleration_j2000(const cg_time_t *time_utc, cg_vec3_t r_j2000)
+{
+    double m[3][3];
+    cg_vec3_t r_body;
+    cg_vec3_t a_body;
+    cg_itrs_to_j2000_matrix(time_utc, m);
+    r_body.x = m[0][0] * r_j2000.x + m[1][0] * r_j2000.y + m[2][0] * r_j2000.z;
+    r_body.y = m[0][1] * r_j2000.x + m[1][1] * r_j2000.y + m[2][1] * r_j2000.z;
+    r_body.z = m[0][2] * r_j2000.x + m[1][2] * r_j2000.y + m[2][2] * r_j2000.z;
+    a_body = cg_gravity_acceleration_body_fixed(r_body);
+    return cg_mat_vec(m, a_body);
+}
+
+static double cg_radians_from_degrees(double degrees)
+{
+    return degrees * CG_PI / 180.0;
+}
+
+static cg_vec3_t cg_ecliptic_to_equatorial(
+    double radius_m,
+    double longitude_rad,
+    double latitude_rad,
+    double obliquity_rad)
+{
+    double cos_beta = cos(latitude_rad);
+    double x_ecl = radius_m * cos_beta * cos(longitude_rad);
+    double y_ecl = radius_m * cos_beta * sin(longitude_rad);
+    double z_ecl = radius_m * sin(latitude_rad);
+    double cos_eps = cos(obliquity_rad);
+    double sin_eps = sin(obliquity_rad);
+    cg_vec3_t r;
+    r.x = x_ecl;
+    r.y = y_ecl * cos_eps - z_ecl * sin_eps;
+    r.z = y_ecl * sin_eps + z_ecl * cos_eps;
+    return r;
+}
+
+static cg_vec3_t cg_sun_position_j2000(const cg_time_t *time_utc)
+{
+    double jd_tt = time_utc->jd_utc + CG_TT_MINUS_UTC_SECONDS / CG_SECONDS_PER_DAY;
+    double d = jd_tt - CG_JD_J2000;
+    double mean_longitude = cg_anp(cg_radians_from_degrees(280.460 + 0.9856474 * d));
+    double mean_anomaly = cg_anp(cg_radians_from_degrees(357.528 + 0.9856003 * d));
+    double ecliptic_longitude = cg_anp(mean_longitude +
+        cg_radians_from_degrees(1.915) * sin(mean_anomaly) +
+        cg_radians_from_degrees(0.020) * sin(2.0 * mean_anomaly));
+    double radius_au = 1.00014 - 0.01671 * cos(mean_anomaly) -
+        0.00014 * cos(2.0 * mean_anomaly);
+    double obliquity = cg_radians_from_degrees(23.439291 - 0.0000004 * d);
+    return cg_ecliptic_to_equatorial(
+        radius_au * CG_ASTRONOMICAL_UNIT_M, ecliptic_longitude, 0.0, obliquity);
+}
+
+static cg_vec3_t cg_moon_position_j2000(const cg_time_t *time_utc)
+{
+    double jd_tt = time_utc->jd_utc + CG_TT_MINUS_UTC_SECONDS / CG_SECONDS_PER_DAY;
+    double d = jd_tt - CG_JD_J2000;
+    double mean_longitude = cg_anp(cg_radians_from_degrees(218.316 + 13.176396 * d));
+    double mean_anomaly = cg_anp(cg_radians_from_degrees(134.963 + 13.064993 * d));
+    double argument_latitude = cg_anp(cg_radians_from_degrees(93.272 + 13.229350 * d));
+    double ecliptic_longitude = cg_anp(mean_longitude + cg_radians_from_degrees(6.289) * sin(mean_anomaly));
+    double ecliptic_latitude = cg_radians_from_degrees(5.128) * sin(argument_latitude);
+    double radius_m = (385001.0 - 20905.0 * cos(mean_anomaly)) * 1000.0;
+    double t = (jd_tt - CG_JD_J2000) / CG_JULIAN_CENTURY;
+    double obliquity = cg_radians_from_degrees(23.439291 - 0.0130042 * t);
+    return cg_ecliptic_to_equatorial(radius_m, ecliptic_longitude, ecliptic_latitude, obliquity);
+}
+
+static cg_vec3_t cg_third_body_acceleration(cg_vec3_t r_sat, cg_vec3_t r_body, double mu_body)
+{
+    cg_vec3_t sat_to_body = cg_vec_sub(r_body, r_sat);
+    double d_sat = cg_vec_norm(sat_to_body);
+    double d_body = cg_vec_norm(r_body);
+    cg_vec3_t zero;
+    zero.x = zero.y = zero.z = 0.0;
+    if (d_sat <= 0.0 || d_body <= 0.0) {
+        return zero;
+    }
+    return cg_vec_sub(
+        cg_vec_scale(sat_to_body, mu_body / (d_sat * d_sat * d_sat)),
+        cg_vec_scale(r_body, mu_body / (d_body * d_body * d_body)));
+}
+
+static double cg_atmosphere_density_kgpm3(double altitude_m)
+{
+    typedef struct cg_density_point_t {
+        double altitude_m;
+        double density;
+    } cg_density_point_t;
+    static const cg_density_point_t table[] = {
+        {180000.0, 5.464e-10},
+        {200000.0, 2.789e-10},
+        {250000.0, 7.248e-11},
+        {300000.0, 2.418e-11},
+        {350000.0, 9.518e-12},
+        {400000.0, 3.725e-12},
+        {450000.0, 1.585e-12},
+        {500000.0, 6.967e-13},
+        {550000.0, 3.177e-13},
+        {600000.0, 1.454e-13},
+        {700000.0, 3.614e-14},
+        {800000.0, 1.170e-14},
+        {900000.0, 5.245e-15},
+        {1000000.0, 3.019e-15}
+    };
+    size_t count = sizeof(table) / sizeof(table[0]);
+    size_t i;
+    if (altitude_m <= table[0].altitude_m) {
+        return table[0].density;
+    }
+    if (altitude_m >= table[count - 1U].altitude_m) {
+        double h_scale = 120000.0;
+        return table[count - 1U].density *
+            exp(-(altitude_m - table[count - 1U].altitude_m) / h_scale);
+    }
+    for (i = 1U; i < count; ++i) {
+        if (altitude_m <= table[i].altitude_m) {
+            double f = (altitude_m - table[i - 1U].altitude_m) /
+                (table[i].altitude_m - table[i - 1U].altitude_m);
+            double log_rho = log(table[i - 1U].density) +
+                f * (log(table[i].density) - log(table[i - 1U].density));
+            return exp(log_rho);
+        }
+    }
+    return table[count - 1U].density;
+}
+
+static cg_vec3_t cg_drag_acceleration_per_ballistic(
+    const cg_time_t *time_utc,
+    cg_vec3_t r_j2000,
+    cg_vec3_t v_j2000)
+{
+    double m[3][3];
+    cg_vec3_t r_body;
+    cg_vec3_t atmosphere_velocity_body;
+    cg_vec3_t atmosphere_velocity_j2000;
+    cg_vec3_t relative_velocity;
+    double altitude_m;
+    double density;
+    double speed;
+    cg_vec3_t zero;
+    zero.x = zero.y = zero.z = 0.0;
+    cg_itrs_to_j2000_matrix(time_utc, m);
+    r_body.x = m[0][0] * r_j2000.x + m[1][0] * r_j2000.y + m[2][0] * r_j2000.z;
+    r_body.y = m[0][1] * r_j2000.x + m[1][1] * r_j2000.y + m[2][1] * r_j2000.z;
+    r_body.z = m[0][2] * r_j2000.x + m[1][2] * r_j2000.y + m[2][2] * r_j2000.z;
+    altitude_m = cg_vec_norm(r_body) - CG_EARTH_EQUATORIAL_RADIUS_M;
+    density = cg_atmosphere_density_kgpm3(altitude_m);
+    atmosphere_velocity_body.x = -CG_OMEGA_EARTH * r_body.y;
+    atmosphere_velocity_body.y = CG_OMEGA_EARTH * r_body.x;
+    atmosphere_velocity_body.z = 0.0;
+    atmosphere_velocity_j2000 = cg_mat_vec(m, atmosphere_velocity_body);
+    relative_velocity = cg_vec_sub(v_j2000, atmosphere_velocity_j2000);
+    speed = cg_vec_norm(relative_velocity);
+    if (speed <= 0.0 || density <= 0.0) {
+        return zero;
+    }
+    return cg_vec_scale(relative_velocity, -0.5 * density * speed);
+}
+
+static double cg_cylindrical_shadow_factor(cg_vec3_t r_sat, cg_vec3_t r_sun)
+{
+    double sun_distance = cg_vec_norm(r_sun);
+    double cross_track;
+    if (sun_distance <= 0.0 || cg_vec_dot(r_sat, r_sun) >= 0.0) {
+        return 1.0;
+    }
+    cross_track = cg_vec_norm(cg_vec_cross(r_sat, r_sun)) / sun_distance;
+    return cross_track < CG_EARTH_EQUATORIAL_RADIUS_M ? 0.0 : 1.0;
+}
+
+static cg_vec3_t cg_solar_radiation_pressure_acceleration(
+    cg_vec3_t r_sat,
+    cg_vec3_t r_sun,
+    double area_over_mass)
+{
+    cg_vec3_t sun_to_sat;
+    double distance;
+    double shadow;
+    double scale;
+    cg_vec3_t zero;
+    zero.x = zero.y = zero.z = 0.0;
+    if (area_over_mass <= 0.0) {
+        return zero;
+    }
+    sun_to_sat = cg_vec_sub(r_sat, r_sun);
+    distance = cg_vec_norm(sun_to_sat);
+    if (distance <= 0.0) {
+        return zero;
+    }
+    shadow = cg_cylindrical_shadow_factor(r_sat, r_sun);
+    scale = shadow * CG_SOLAR_RADIATION_PRESSURE * area_over_mass *
+        (CG_ASTRONOMICAL_UNIT_M * CG_ASTRONOMICAL_UNIT_M) / (distance * distance);
+    return cg_vec_scale(sun_to_sat, scale / distance);
+}
+
+static cg_vec3_t cg_empirical_rtn_acceleration(
+    cg_vec3_t r_j2000,
+    cg_vec3_t v_j2000,
+    cg_vec3_t empirical_rtn)
+{
+    cg_vec3_t radial = cg_vec_unit(r_j2000);
+    cg_vec3_t normal = cg_vec_unit(cg_vec_cross(r_j2000, v_j2000));
+    cg_vec3_t transverse = cg_vec_cross(normal, radial);
+    return cg_vec_add(
+        cg_vec_add(cg_vec_scale(radial, empirical_rtn.x),
+                   cg_vec_scale(transverse, empirical_rtn.y)),
+        cg_vec_scale(normal, empirical_rtn.z));
+}
+
+static cg_force_model_t cg_default_force_model(void)
+{
+    cg_force_model_t force_model;
+    force_model.drag_ballistic_m2_per_kg = 0.0040;
+    force_model.srp_area_m2_per_kg = 0.0040;
+    force_model.empirical_rtn_mps2.x = 0.0;
+    force_model.empirical_rtn_mps2.y = 0.0;
+    force_model.empirical_rtn_mps2.z = 0.0;
+    return force_model;
+}
+
+static cg_vec3_t cg_force_model_acceleration(
+    const cg_time_t *time_utc,
+    cg_vec3_t r_j2000,
+    cg_vec3_t v_j2000,
+    const cg_force_model_t *force_model)
+{
+    cg_vec3_t acceleration = cg_gravity_acceleration_j2000(time_utc, r_j2000);
+    cg_vec3_t r_sun = cg_sun_position_j2000(time_utc);
+    cg_vec3_t r_moon = cg_moon_position_j2000(time_utc);
+    acceleration = cg_vec_add(acceleration, cg_third_body_acceleration(r_j2000, r_sun, CG_SUN_MU));
+    acceleration = cg_vec_add(acceleration, cg_third_body_acceleration(r_j2000, r_moon, CG_MOON_MU));
+    acceleration = cg_vec_add(
+        acceleration,
+        cg_vec_scale(
+            cg_drag_acceleration_per_ballistic(time_utc, r_j2000, v_j2000),
+            force_model->drag_ballistic_m2_per_kg));
+    acceleration = cg_vec_add(
+        acceleration,
+        cg_solar_radiation_pressure_acceleration(
+            r_j2000, r_sun, force_model->srp_area_m2_per_kg));
+    acceleration = cg_vec_add(
+        acceleration,
+        cg_empirical_rtn_acceleration(r_j2000, v_j2000, force_model->empirical_rtn_mps2));
+    return acceleration;
+}
+
+static void cg_state_derivative(
+    const double state[6],
+    const cg_time_t *time_utc,
+    const cg_force_model_t *force_model,
+    double derivative[6])
+{
+    cg_vec3_t r;
+    cg_vec3_t v;
+    cg_vec3_t a;
+    r.x = state[0]; r.y = state[1]; r.z = state[2];
+    v.x = state[3]; v.y = state[4]; v.z = state[5];
+    a = cg_force_model_acceleration(time_utc, r, v, force_model);
+    derivative[0] = state[3];
+    derivative[1] = state[4];
+    derivative[2] = state[5];
+    derivative[3] = a.x;
+    derivative[4] = a.y;
+    derivative[5] = a.z;
+}
+
+static int cg_propagate_orbit(
+    const cg_state_t *initial,
+    const cg_time_t *target_time,
+    double step_seconds,
+    const cg_force_model_t *force_model,
+    cg_state_t *out_state)
+{
+    double y[6];
+    double elapsed = 0.0;
+    double remaining;
+    double direction;
+    int i;
+    if (!initial || !target_time || !force_model || !out_state || step_seconds <= 0.0) {
+        return CG_ERR_INVALID_ARGUMENT;
+    }
+    y[0] = initial->r_j2000_m.x;
+    y[1] = initial->r_j2000_m.y;
+    y[2] = initial->r_j2000_m.z;
+    y[3] = initial->v_j2000_mps.x;
+    y[4] = initial->v_j2000_mps.y;
+    y[5] = initial->v_j2000_mps.z;
+
+    remaining = fabs(target_time->unix_seconds - initial->time_utc.unix_seconds);
+    direction = target_time->unix_seconds >= initial->time_utc.unix_seconds ? 1.0 : -1.0;
+    while (remaining > 1.0e-9) {
+        double h = direction * fmin(step_seconds, remaining);
+        double k1[6];
+        double k2[6];
+        double k3[6];
+        double k4[6];
+        double temp[6];
+        cg_time_t step_time;
+
+        step_time = cg_time_from_unix_seconds(initial->time_utc.unix_seconds + elapsed);
+        cg_state_derivative(y, &step_time, force_model, k1);
+        for (i = 0; i < 6; ++i) {
+            temp[i] = y[i] + 0.5 * h * k1[i];
+        }
+        step_time = cg_time_from_unix_seconds(initial->time_utc.unix_seconds + elapsed + 0.5 * h);
+        cg_state_derivative(temp, &step_time, force_model, k2);
+        for (i = 0; i < 6; ++i) {
+            temp[i] = y[i] + 0.5 * h * k2[i];
+        }
+        step_time = cg_time_from_unix_seconds(initial->time_utc.unix_seconds + elapsed + 0.5 * h);
+        cg_state_derivative(temp, &step_time, force_model, k3);
+        for (i = 0; i < 6; ++i) {
+            temp[i] = y[i] + h * k3[i];
+        }
+        step_time = cg_time_from_unix_seconds(initial->time_utc.unix_seconds + elapsed + h);
+        cg_state_derivative(temp, &step_time, force_model, k4);
+        for (i = 0; i < 6; ++i) {
+            y[i] += h * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]) / 6.0;
+        }
+        elapsed += h;
+        remaining -= fabs(h);
+    }
+
+    out_state->time_utc = *target_time;
+    out_state->r_j2000_m.x = y[0];
+    out_state->r_j2000_m.y = y[1];
+    out_state->r_j2000_m.z = y[2];
+    out_state->v_j2000_mps.x = y[3];
+    out_state->v_j2000_mps.y = y[4];
+    out_state->v_j2000_mps.z = y[5];
+    return CG_OK;
+}
+
 int cg_precompute_observations(cg_observation_t *observations, size_t count)
 {
     if (!observations || count < 2) {
@@ -773,12 +1395,448 @@ static int cg_interpolate_state_cached(
     return CG_OK;
 }
 
+static void cg_select_extrapolation_history(
+    const cg_observation_t *obs,
+    size_t count,
+    size_t *first,
+    size_t *last)
+{
+    size_t f = 0U;
+    size_t l = count - 1U;
+    double earliest = obs[l].time_utc.unix_seconds - CG_EXTRAPOLATION_HISTORY_SECONDS;
+    while (f < l && obs[f].time_utc.unix_seconds < earliest) {
+        ++f;
+    }
+    if (f >= l && l > 0U) {
+        f = l - 1U;
+    }
+    *first = f;
+    *last = l;
+}
+
+static int cg_refine_latest_state_from_tail(
+    const cg_observation_t *obs,
+    size_t count,
+    cg_state_t *state)
+{
+    size_t first;
+    size_t last;
+    cg_fit_t fit;
+    cg_state_t refined;
+    int status;
+    if (!obs || !state || count < 16U) {
+        return 0;
+    }
+    last = count - 1U;
+    first = last;
+    while (first > 0U &&
+           obs[last].time_utc.unix_seconds - obs[first - 1U].time_utc.unix_seconds <=
+               CG_TAIL_REFINE_SECONDS + 1.0e-9) {
+        --first;
+    }
+    if (last - first + 1U < 16U) {
+        return 0;
+    }
+    status = cg_build_fit(obs, first, last, 7, &fit);
+    if (status != CG_OK) {
+        return 0;
+    }
+    cg_fit_eval(&fit, &obs[last].time_utc, &refined);
+    state->time_utc = obs[last].time_utc;
+    state->r_j2000_m = cg_observation_to_j2000_position(&obs[last]);
+    state->v_j2000_mps = refined.v_j2000_mps;
+    return 1;
+}
+
+static int cg_latest_state_for_extrapolation(
+    const cg_observation_t *obs,
+    size_t count,
+    const cg_options_t *opt,
+    cg_state_t *out)
+{
+    size_t first;
+    size_t last;
+    cg_fit_t fit;
+    int status;
+    if (!obs || !opt || !out || count < 2U) {
+        return CG_ERR_INVALID_ARGUMENT;
+    }
+    cg_select_extrapolation_history(obs, count, &first, &last);
+    status = cg_build_fit(obs, first, last, opt->degree, &fit);
+    if (status != CG_OK) {
+        return status;
+    }
+    cg_fit_eval(&fit, &obs[last].time_utc, out);
+    out->time_utc = obs[last].time_utc;
+    out->r_j2000_m = cg_observation_to_j2000_position(&obs[last]);
+    cg_refine_latest_state_from_tail(obs, count, out);
+    return CG_OK;
+}
+
+static int cg_fit_state_for_force_model(
+    const cg_observation_t *obs,
+    size_t count,
+    const cg_time_t *query,
+    const cg_options_t *opt,
+    cg_state_t *out)
+{
+    return cg_interpolate_state_cached(obs, count, query, opt, NULL, out);
+}
+
+static double cg_vec_component(cg_vec3_t v, int coord)
+{
+    if (coord == 0) {
+        return v.x;
+    }
+    if (coord == 1) {
+        return v.y;
+    }
+    return v.z;
+}
+
+static void cg_add_weighted_normal_row(
+    double normal[CG_MAX_DEGREE + 1][CG_MAX_DEGREE + 2],
+    const double columns[4],
+    double observed,
+    double weight)
+{
+    int i;
+    int j;
+    for (i = 0; i < 4; ++i) {
+        double ci = weight * columns[i];
+        for (j = 0; j < 4; ++j) {
+            normal[i][j] += ci * weight * columns[j];
+        }
+        normal[i][4] += ci * weight * observed;
+    }
+}
+
+static double cg_clamp_empirical_acceleration(double value)
+{
+    if (!isfinite(value)) {
+        return 0.0;
+    }
+    if (value < -2.0e-5) {
+        return -2.0e-5;
+    }
+    if (value > 2.0e-5) {
+        return 2.0e-5;
+    }
+    return value;
+}
+
+static cg_force_model_t cg_estimate_force_model(
+    const cg_observation_t *obs,
+    size_t count,
+    const cg_options_t *opt,
+    const cg_state_t *latest_state)
+{
+    static const double taus[] = {120.0, 180.0, 240.0, 300.0, 420.0, 540.0};
+    static const double parameter_scales[4] = {0.0040, 1.0e-6, 1.0e-6, 1.0e-6};
+    static const double prior_sigma[4] = {5.0, 8.0, 8.0, 8.0};
+    cg_force_model_t model = cg_default_force_model();
+    cg_force_model_t base_model;
+    double normal[CG_MAX_DEGREE + 1][CG_MAX_DEGREE + 2];
+    double solution[CG_MAX_DEGREE + 1];
+    double latest_unix;
+    double first_unix;
+    cg_vec3_t radial;
+    cg_vec3_t orbit_normal;
+    cg_vec3_t transverse;
+    int arc_count = 0;
+    size_t tau_index;
+    int param;
+    int coord;
+    int status;
+    if (!obs || !opt || !latest_state || count < 16U) {
+        return model;
+    }
+    latest_unix = latest_state->time_utc.unix_seconds;
+    first_unix = obs[0].time_utc.unix_seconds;
+    if (latest_unix - first_unix < 240.0) {
+        return model;
+    }
+    radial = cg_vec_unit(latest_state->r_j2000_m);
+    orbit_normal = cg_vec_unit(cg_vec_cross(latest_state->r_j2000_m, latest_state->v_j2000_mps));
+    transverse = cg_vec_cross(orbit_normal, radial);
+    if (cg_vec_norm(radial) <= 0.0 ||
+        cg_vec_norm(orbit_normal) <= 0.0 ||
+        cg_vec_norm(transverse) <= 0.0) {
+        return model;
+    }
+
+    memset(normal, 0, sizeof(normal));
+    base_model = model;
+    base_model.empirical_rtn_mps2.x = 0.0;
+    base_model.empirical_rtn_mps2.y = 0.0;
+    base_model.empirical_rtn_mps2.z = 0.0;
+
+    for (tau_index = 0U; tau_index < sizeof(taus) / sizeof(taus[0]); ++tau_index) {
+        double tau = taus[tau_index];
+        cg_time_t anchor_time;
+        cg_state_t anchor_state;
+        cg_state_t propagated;
+        cg_state_t perturbed[4];
+        cg_vec3_t position_residual;
+        cg_vec3_t velocity_residual;
+        double weight;
+        if (latest_unix - tau < first_unix - 1.0e-9) {
+            continue;
+        }
+        anchor_time = cg_time_from_unix_seconds(latest_unix - tau);
+        status = cg_fit_state_for_force_model(obs, count, &anchor_time, opt, &anchor_state);
+        if (status != CG_OK) {
+            continue;
+        }
+        status = cg_propagate_orbit(
+            &anchor_state,
+            &latest_state->time_utc,
+            CG_PROPAGATION_STEP_SECONDS,
+            &base_model,
+            &propagated);
+        if (status != CG_OK) {
+            continue;
+        }
+        position_residual = cg_vec_sub(latest_state->r_j2000_m, propagated.r_j2000_m);
+        velocity_residual = cg_vec_sub(latest_state->v_j2000_mps, propagated.v_j2000_mps);
+
+        for (param = 0; param < 4; ++param) {
+            cg_force_model_t perturbed_model = base_model;
+            if (param == 0) {
+                perturbed_model.drag_ballistic_m2_per_kg += parameter_scales[param];
+            } else if (param == 1) {
+                perturbed_model.empirical_rtn_mps2.x += parameter_scales[param];
+            } else if (param == 2) {
+                perturbed_model.empirical_rtn_mps2.y += parameter_scales[param];
+            } else {
+                perturbed_model.empirical_rtn_mps2.z += parameter_scales[param];
+            }
+            status = cg_propagate_orbit(
+                &anchor_state,
+                &latest_state->time_utc,
+                CG_PROPAGATION_STEP_SECONDS,
+                &perturbed_model,
+                &perturbed[param]);
+            if (status != CG_OK) {
+                perturbed[param] = propagated;
+            }
+        }
+
+        weight = sqrt(tau / 300.0);
+        for (coord = 0; coord < 3; ++coord) {
+            double columns[4];
+            for (param = 0; param < 4; ++param) {
+                columns[param] = cg_vec_component(
+                    cg_vec_sub(perturbed[param].r_j2000_m, propagated.r_j2000_m),
+                    coord);
+            }
+            cg_add_weighted_normal_row(
+                normal,
+                columns,
+                cg_vec_component(position_residual, coord),
+                weight);
+        }
+        for (coord = 0; coord < 3; ++coord) {
+            double columns[4];
+            double velocity_weight_seconds = 600.0;
+            for (param = 0; param < 4; ++param) {
+                columns[param] = velocity_weight_seconds * cg_vec_component(
+                    cg_vec_sub(perturbed[param].v_j2000_mps, propagated.v_j2000_mps),
+                    coord);
+            }
+            cg_add_weighted_normal_row(
+                normal,
+                columns,
+                velocity_weight_seconds * cg_vec_component(velocity_residual, coord),
+                0.35 * weight);
+        }
+        ++arc_count;
+    }
+
+    if (arc_count < 2) {
+        return model;
+    }
+    for (param = 0; param < 4; ++param) {
+        normal[param][param] += 1.0 / (prior_sigma[param] * prior_sigma[param]);
+        solution[param] = 0.0;
+    }
+    status = cg_solve_linear(4, normal, solution);
+    if (status != CG_OK) {
+        return model;
+    }
+    model.drag_ballistic_m2_per_kg += solution[0] * parameter_scales[0];
+    if (model.drag_ballistic_m2_per_kg < 0.0) {
+        model.drag_ballistic_m2_per_kg = 0.0;
+    }
+    if (model.drag_ballistic_m2_per_kg > 0.030) {
+        model.drag_ballistic_m2_per_kg = 0.030;
+    }
+    model.empirical_rtn_mps2.x = cg_clamp_empirical_acceleration(solution[1] * parameter_scales[1]);
+    model.empirical_rtn_mps2.y = cg_clamp_empirical_acceleration(solution[2] * parameter_scales[2]);
+    model.empirical_rtn_mps2.z = cg_clamp_empirical_acceleration(solution[3] * parameter_scales[3]);
+    return model;
+}
+
+static void cg_prepare_holdout_correction(
+    const cg_observation_t *obs,
+    size_t count,
+    const cg_options_t *opt,
+    cg_future_cache_t *cache)
+{
+    double latest_unix;
+    double first_unix;
+    double tau;
+    cg_time_t anchor_time;
+    cg_state_t anchor_state;
+    cg_state_t propagated;
+    cg_vec3_t residual_position;
+    cg_vec3_t residual_velocity;
+    cg_vec3_t radial;
+    cg_vec3_t normal;
+    cg_vec3_t transverse;
+    double residual_t;
+    double residual_vt;
+    int status;
+    if (!obs || !opt || !cache || !cache->valid || count < 16U) {
+        return;
+    }
+    latest_unix = cache->latest_state.time_utc.unix_seconds;
+    first_unix = obs[0].time_utc.unix_seconds;
+    tau = CG_HOLDOUT_CORRECTION_SECONDS;
+    if (latest_unix - tau < first_unix - 1.0e-9) {
+        tau = latest_unix - first_unix;
+    }
+    if (tau < 300.0) {
+        return;
+    }
+    anchor_time = cg_time_from_unix_seconds(latest_unix - tau);
+    status = cg_fit_state_for_force_model(obs, count, &anchor_time, opt, &anchor_state);
+    if (status != CG_OK) {
+        return;
+    }
+    status = cg_propagate_orbit(
+        &anchor_state,
+        &cache->latest_state.time_utc,
+        CG_PROPAGATION_STEP_SECONDS,
+        &cache->force_model,
+        &propagated);
+    if (status != CG_OK) {
+        return;
+    }
+    radial = cg_vec_unit(cache->latest_state.r_j2000_m);
+    normal = cg_vec_unit(cg_vec_cross(cache->latest_state.r_j2000_m, cache->latest_state.v_j2000_mps));
+    transverse = cg_vec_cross(normal, radial);
+    if (cg_vec_norm(transverse) <= 0.0) {
+        return;
+    }
+    residual_position = cg_vec_sub(cache->latest_state.r_j2000_m, propagated.r_j2000_m);
+    residual_velocity = cg_vec_sub(cache->latest_state.v_j2000_mps, propagated.v_j2000_mps);
+    residual_t = cg_vec_dot(residual_position, transverse);
+    residual_vt = cg_vec_dot(residual_velocity, transverse);
+    cache->holdout_valid = 1;
+    cache->holdout_tau_seconds = tau;
+    cache->holdout_position_residual = cg_vec_scale(transverse, residual_t);
+    cache->holdout_velocity_residual = cg_vec_scale(transverse, residual_vt);
+}
+
+static void cg_apply_holdout_correction(
+    const cg_future_cache_t *cache,
+    double horizon,
+    cg_state_t *state)
+{
+    double ratio;
+    double position_scale;
+    double velocity_scale;
+    double correction_norm;
+    if (!cache || !state || !cache->holdout_valid ||
+        horizon <= 0.0 || cache->holdout_tau_seconds <= 0.0) {
+        return;
+    }
+    ratio = horizon / cache->holdout_tau_seconds;
+    position_scale = CG_HOLDOUT_CORRECTION_GAIN * ratio * ratio;
+    velocity_scale = CG_HOLDOUT_CORRECTION_GAIN * ratio;
+    correction_norm = cg_vec_norm(cache->holdout_position_residual) * fabs(position_scale);
+    if (correction_norm > CG_HOLDOUT_CORRECTION_MAX_M &&
+        correction_norm > 0.0) {
+        position_scale *= CG_HOLDOUT_CORRECTION_MAX_M / correction_norm;
+    }
+    state->r_j2000_m = cg_vec_add(
+        state->r_j2000_m,
+        cg_vec_scale(cache->holdout_position_residual, position_scale));
+    state->v_j2000_mps = cg_vec_add(
+        state->v_j2000_mps,
+        cg_vec_scale(cache->holdout_velocity_residual, velocity_scale));
+}
+
+static int cg_extrapolate_future(
+    const cg_observation_t *obs,
+    size_t count,
+    const cg_time_t *query,
+    const cg_options_t *opt,
+    cg_future_cache_t *cache,
+    cg_state_t *out)
+{
+    double latest = obs[count - 1U].time_utc.unix_seconds;
+    double horizon = query->unix_seconds - latest;
+    const cg_state_t *source;
+    int status;
+    if (!cache || !out || horizon < -1.0e-9) {
+        return CG_ERR_INVALID_ARGUMENT;
+    }
+    if (horizon > CG_MAX_EXTRAPOLATION_SECONDS + 1.0e-9) {
+        return CG_ERR_RANGE;
+    }
+    if (!cache->valid || fabs(cache->latest_unix_seconds - latest) > 1.0e-9) {
+        cg_state_t latest_state;
+        status = cg_latest_state_for_extrapolation(obs, count, opt, &latest_state);
+        if (status != CG_OK) {
+            memset(cache, 0, sizeof(*cache));
+            return status;
+        }
+        memset(cache, 0, sizeof(*cache));
+        cache->valid = 1;
+        cache->latest_unix_seconds = latest;
+        cache->latest_state = latest_state;
+        cache->last_state = latest_state;
+        cache->force_model = cg_estimate_force_model(obs, count, opt, &latest_state);
+        cg_prepare_holdout_correction(obs, count, opt, cache);
+    }
+    if (horizon <= 1.0e-9) {
+        *out = cache->latest_state;
+        out->time_utc = *query;
+        return CG_OK;
+    }
+    source = &cache->latest_state;
+    if (query->unix_seconds >= cache->last_state.time_utc.unix_seconds - 1.0e-9) {
+        source = &cache->last_state;
+    }
+    {
+        cg_state_t propagated;
+        status = cg_propagate_orbit(
+            source,
+            query,
+            CG_PROPAGATION_STEP_SECONDS,
+            &cache->force_model,
+            &propagated);
+        if (status != CG_OK) {
+            return status;
+        }
+        if (query->unix_seconds >= cache->last_state.time_utc.unix_seconds - 1.0e-9) {
+            cache->last_state = propagated;
+        }
+        *out = propagated;
+        cg_apply_holdout_correction(cache, horizon, out);
+    }
+    return CG_OK;
+}
+
 static int cg_query_state_internal(
     const cg_observation_t *obs,
     size_t count,
     const cg_time_t *query,
     const cg_options_t *opt,
     cg_fit_cache_t *main_cache,
+    cg_future_cache_t *future_cache,
     cg_state_t *out)
 {
     if (query->unix_seconds < obs[0].time_utc.unix_seconds - 1.0e-9) {
@@ -787,12 +1845,13 @@ static int cg_query_state_internal(
     if (query->unix_seconds <= obs[count - 1].time_utc.unix_seconds + 1.0e-9) {
         return cg_interpolate_state_cached(obs, count, query, opt, main_cache, out);
     }
-    return CG_ERR_RANGE;
+    return cg_extrapolate_future(obs, count, query, opt, future_cache, out);
 }
 
 static void cg_context_invalidate_cache(cg_context_t *context)
 {
     memset(&context->main_cache, 0, sizeof(context->main_cache));
+    memset(&context->future_cache, 0, sizeof(context->future_cache));
 }
 
 static void cg_reverse_observations(cg_observation_t *obs, size_t first, size_t last)
@@ -932,7 +1991,8 @@ int cg_context_query_state(
 
     cg_context_linearize(context);
     return cg_query_state_internal(context->observations, context->count, query_time_utc,
-                                   &context->options, &context->main_cache, out_state);
+                                   &context->options, &context->main_cache,
+                                   &context->future_cache, out_state);
 }
 
 const char *cg_status_string(int status)
