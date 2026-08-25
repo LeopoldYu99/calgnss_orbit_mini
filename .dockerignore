@@ -1,0 +1,6 @@
+.git
+.vs
+build
+build-*
+out
+*.obj

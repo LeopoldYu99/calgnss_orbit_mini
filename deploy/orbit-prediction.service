@@ -1,0 +1,22 @@
+[Unit]
+Description=Orbit Prediction gRPC microservice
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orbit
+Group=orbit
+EnvironmentFile=/etc/orbit-prediction.env
+ExecStart=/opt/orbit-prediction/bin/orbit_prediction_server
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
