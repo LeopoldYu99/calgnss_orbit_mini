@@ -66,7 +66,7 @@ int main()
 {
     try {
         const std::string address =
-            EnvironmentString("ORBIT_GRPC_ADDRESS", "192.168.10.100:50051");
+            EnvironmentString("ORBIT_GRPC_ADDRESS", "192.168.104.100:50051");
         orbit_prediction::OrbitPredictionServiceImpl service(LoadOptions());
 
         grpc::EnableDefaultHealthCheckService(true);

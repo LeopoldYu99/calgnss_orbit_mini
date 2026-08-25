@@ -4,11 +4,11 @@
 
 - Proto package：`orbit_prediction`
 - Service：`orbit_prediction.OrbitPredictionService`
-- 生产地址：`192.168.10.100:50051`
+- 生产地址：`192.168.104.100:50051`
 - 传输：当前使用内网明文 gRPC；跨不可信网络部署前应启用 TLS 和鉴权。
 
 服务监听地址由 `ORBIT_GRPC_ADDRESS` 配置。生产 systemd 配置使用
-`192.168.10.100:50051`。本机、WSL2 或容器测试应使用
+`192.168.104.100:50051`。本机、WSL2 或容器测试应使用
 `ORBIT_GRPC_ADDRESS=0.0.0.0:50051`，再从客户端访问 `localhost:50051`。
 
 ## RPC 行为
@@ -169,16 +169,16 @@ WSL2 测试：
 ORBIT_GRPC_ADDRESS=0.0.0.0:50051 ./build-wsl/orbit_prediction_server
 ```
 
-如果目标 Linux 主机确实配置了 `192.168.10.100`：
+如果目标 Linux 主机确实配置了 `192.168.104.100`：
 
 ```bash
-ORBIT_GRPC_ADDRESS=192.168.10.100:50051 ./build-wsl/orbit_prediction_server
+ORBIT_GRPC_ADDRESS=192.168.104.100:50051 ./build-wsl/orbit_prediction_server
 ```
 
 检查地址是否存在：
 
 ```bash
-ip address show | grep 192.168.10.100
+ip address show | grep 192.168.104.100
 ```
 
 ## systemd 部署
@@ -204,5 +204,5 @@ docker run --rm -p 50051:50051 orbit-prediction
 此时客户端连接 `localhost:50051`。生产主机需要暴露指定地址时，可使用：
 
 ```bash
-docker run --rm -p 192.168.10.100:50051:50051 orbit-prediction
+docker run --rm -p 192.168.104.100:50051:50051 orbit-prediction
 ```
