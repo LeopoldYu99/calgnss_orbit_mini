@@ -9,8 +9,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(CALGNSS_BUILD_GRPC "Build the OrbitPredictionService gRPC microservice" ON)
+option(CALGNSS_BUILD_MQ "Build the OrbitPredictionService POSIX MQ service" ON)
 option(CALGNSS_BUILD_TESTS "Build project tests" ON)
+set(ORBIT_RTKLIB_SOURCE_DIR "" CACHE PATH "RTKLIB 2.4.3 source directory")
 
 set(CALGNSS_ORBIT_MINI_SOURCES
     src/calgnss_orbit_mini.c
@@ -66,80 +67,156 @@ if (CALGNSS_BUILD_TESTS)
     add_test(NAME orbit_prediction_engine_test COMMAND orbit_prediction_engine_test)
 endif()
 
-if (CALGNSS_BUILD_GRPC)
-    find_package(Protobuf REQUIRED)
-    find_package(gRPC CONFIG REQUIRED)
-
-    set(ORBIT_PROTO_FILE ${CMAKE_CURRENT_SOURCE_DIR}/proto/orbit_prediction.proto)
-    set(ORBIT_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
-    set(ORBIT_PROTO_PATH_ARGS --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto)
-    foreach(PROTOBUF_INCLUDE_DIR IN LISTS Protobuf_INCLUDE_DIRS)
-        list(APPEND ORBIT_PROTO_PATH_ARGS --proto_path=${PROTOBUF_INCLUDE_DIR})
-    endforeach()
-    file(MAKE_DIRECTORY ${ORBIT_GENERATED_DIR})
-
-    if (CMAKE_CROSSCOMPILING)
-        find_program(ORBIT_PROTOC_EXECUTABLE protoc REQUIRED NO_CMAKE_FIND_ROOT_PATH)
-        find_program(ORBIT_GRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin REQUIRED NO_CMAKE_FIND_ROOT_PATH)
-        set(ORBIT_PROTO_TOOL_DEPENDENCIES)
-    else()
-        set(ORBIT_PROTOC_EXECUTABLE protobuf::protoc)
-        set(ORBIT_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:gRPC::grpc_cpp_plugin>)
-        set(ORBIT_PROTO_TOOL_DEPENDENCIES protobuf::protoc gRPC::grpc_cpp_plugin)
+if (CALGNSS_BUILD_MQ)
+    if (NOT UNIX)
+        message(FATAL_ERROR "The POSIX MQ service requires a Unix-like target")
+    endif()
+    if (NOT ORBIT_RTKLIB_SOURCE_DIR OR
+        NOT EXISTS "${ORBIT_RTKLIB_SOURCE_DIR}/src/rtklib.h")
+        message(FATAL_ERROR
+            "ORBIT_RTKLIB_SOURCE_DIR must point to an RTKLIB 2.4.3 source tree")
+    endif()
+    add_library(orbit_rtklib STATIC
+        ${ORBIT_RTKLIB_SOURCE_DIR}/src/rtkcmn.c
+        ${ORBIT_RTKLIB_SOURCE_DIR}/src/rtcm.c
+        ${ORBIT_RTKLIB_SOURCE_DIR}/src/rtcm2.c
+        ${ORBIT_RTKLIB_SOURCE_DIR}/src/rtcm3.c
+        ${ORBIT_RTKLIB_SOURCE_DIR}/src/rtcm3e.c
+        ${ORBIT_RTKLIB_SOURCE_DIR}/src/ephemeris.c
+        ${ORBIT_RTKLIB_SOURCE_DIR}/src/ionex.c
+        ${ORBIT_RTKLIB_SOURCE_DIR}/src/pntpos.c
+        ${ORBIT_RTKLIB_SOURCE_DIR}/src/preceph.c
+        ${ORBIT_RTKLIB_SOURCE_DIR}/src/sbas.c
+    )
+    target_include_directories(orbit_rtklib PUBLIC ${ORBIT_RTKLIB_SOURCE_DIR}/src)
+    target_compile_definitions(orbit_rtklib PUBLIC
+        NO_STRICT ENAGLO ENAQZS ENAGAL ENACMP ENAIRN NFREQ=5 NEXOBS=3)
+    target_link_libraries(orbit_rtklib PUBLIC m Threads::Threads)
+    if (NOT MSVC)
+        target_compile_options(orbit_rtklib PRIVATE
+            -Wno-unused-const-variable -Wno-discarded-qualifiers)
     endif()
 
-    add_custom_command(
-        OUTPUT
-            ${ORBIT_GENERATED_DIR}/orbit_prediction.pb.cc
-            ${ORBIT_GENERATED_DIR}/orbit_prediction.pb.h
-            ${ORBIT_GENERATED_DIR}/orbit_prediction.grpc.pb.cc
-            ${ORBIT_GENERATED_DIR}/orbit_prediction.grpc.pb.h
-        COMMAND ${ORBIT_PROTOC_EXECUTABLE}
-        ARGS
-            ${ORBIT_PROTO_PATH_ARGS}
-            --cpp_out=${ORBIT_GENERATED_DIR}
-            --grpc_out=${ORBIT_GENERATED_DIR}
-            --plugin=protoc-gen-grpc=${ORBIT_GRPC_CPP_PLUGIN_EXECUTABLE}
-            ${ORBIT_PROTO_FILE}
-        DEPENDS
-            ${ORBIT_PROTO_FILE}
-            ${ORBIT_PROTO_TOOL_DEPENDENCIES}
-        VERBATIM
-    )
+    add_library(orbit_rtcm_positioning STATIC service/rtcm_position_solver.cpp)
+    target_include_directories(orbit_rtcm_positioning PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/service)
+    target_link_libraries(orbit_rtcm_positioning PUBLIC orbit_rtklib)
+    target_compile_definitions(orbit_prediction_engine PUBLIC
+        ORBIT_ENABLE_RTCM_POSITIONING=1)
+    target_include_directories(orbit_prediction_engine PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/service)
+    target_link_libraries(orbit_prediction_engine PUBLIC orbit_rtcm_positioning)
 
-    add_library(orbit_prediction_proto STATIC
-        ${ORBIT_GENERATED_DIR}/orbit_prediction.pb.cc
-        ${ORBIT_GENERATED_DIR}/orbit_prediction.grpc.pb.cc
-    )
-    target_include_directories(orbit_prediction_proto PUBLIC ${ORBIT_GENERATED_DIR})
-    target_link_libraries(orbit_prediction_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
+    if (CALGNSS_BUILD_TESTS)
+        add_executable(rtcm_position_solver_test tests/rtcm_position_solver_test.cpp)
+        target_link_libraries(rtcm_position_solver_test PRIVATE orbit_rtcm_positioning)
+        add_test(NAME rtcm_position_solver_test COMMAND rtcm_position_solver_test)
+    endif()
 
-    add_library(orbit_prediction_grpc_service STATIC
+    add_library(orbit_mq_protocol STATIC src/orbit_mq_protocol.cpp)
+    target_include_directories(orbit_mq_protocol PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    if (MSVC)
+        target_compile_options(orbit_mq_protocol PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(orbit_mq_protocol PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    add_library(orbit_prediction_mq_service STATIC
+        service/heartbeat_mq_publisher.cpp
         service/orbit_prediction_service.cpp
+        service/posix_mq_server.cpp
+        service/telemetry_mq_publisher.cpp
     )
-    target_include_directories(orbit_prediction_grpc_service PUBLIC
+    target_include_directories(orbit_prediction_mq_service PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/service
-        ${ORBIT_GENERATED_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
-    target_link_libraries(orbit_prediction_grpc_service PUBLIC
+    target_link_libraries(orbit_prediction_mq_service PUBLIC
         orbit_prediction_engine
-        orbit_prediction_proto
-        gRPC::grpc++
+        orbit_mq_protocol
+        Threads::Threads
+        rt
     )
     if (MSVC)
-        target_compile_options(orbit_prediction_grpc_service PRIVATE /W4 /permissive-)
+        target_compile_options(orbit_prediction_mq_service PRIVATE /W4 /permissive-)
     else()
-        target_compile_options(orbit_prediction_grpc_service PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_options(orbit_prediction_mq_service PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
     add_executable(orbit_prediction_server service/main.cpp)
-    target_link_libraries(orbit_prediction_server PRIVATE orbit_prediction_grpc_service)
+    target_link_libraries(orbit_prediction_server PRIVATE orbit_prediction_mq_service)
     if (MSVC)
         target_compile_options(orbit_prediction_server PRIVATE /W4 /permissive-)
     else()
         target_compile_options(orbit_prediction_server PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 
-    install(TARGETS orbit_prediction_server RUNTIME DESTINATION bin)
+    add_executable(orbit_mq_cli tools/orbit_mq_cli.cpp)
+    target_link_libraries(orbit_mq_cli PRIVATE
+        orbit_mq_protocol
+        Threads::Threads
+        rt
+    )
+    if (MSVC)
+        target_compile_options(orbit_mq_cli PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(orbit_mq_cli PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    add_executable(rtcm_position_debug tools/rtcm_position_debug.cpp)
+    target_link_libraries(rtcm_position_debug PRIVATE orbit_rtcm_positioning)
+    if (MSVC)
+        target_compile_options(rtcm_position_debug PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(rtcm_position_debug PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    if (CALGNSS_BUILD_TESTS)
+        add_executable(orbit_prediction_mq_smoke_test tests/mq_smoke_test.cpp)
+        target_link_libraries(orbit_prediction_mq_smoke_test PRIVATE
+            orbit_mq_protocol
+            Threads::Threads
+            rt
+        )
+        if (MSVC)
+            target_compile_options(orbit_prediction_mq_smoke_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(orbit_prediction_mq_smoke_test PRIVATE
+                -Wall -Wextra -Wpedantic)
+        endif()
+
+        add_executable(orbit_mq_protocol_test tests/orbit_mq_protocol_test.cpp)
+        target_link_libraries(orbit_mq_protocol_test PRIVATE orbit_mq_protocol)
+        add_test(NAME orbit_mq_protocol_test COMMAND orbit_mq_protocol_test)
+        if (MSVC)
+            target_compile_options(orbit_mq_protocol_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(orbit_mq_protocol_test PRIVATE
+                -Wall -Wextra -Wpedantic)
+        endif()
+
+        add_executable(telemetry_mq_publisher_test tests/telemetry_mq_publisher_test.cpp)
+        target_link_libraries(telemetry_mq_publisher_test PRIVATE orbit_prediction_mq_service)
+        add_test(NAME telemetry_mq_publisher_test COMMAND telemetry_mq_publisher_test)
+        if (MSVC)
+            target_compile_options(telemetry_mq_publisher_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(telemetry_mq_publisher_test PRIVATE
+                -Wall -Wextra -Wpedantic)
+        endif()
+
+        add_executable(heartbeat_mq_publisher_test tests/heartbeat_mq_publisher_test.cpp)
+        target_link_libraries(heartbeat_mq_publisher_test PRIVATE orbit_prediction_mq_service)
+        add_test(NAME heartbeat_mq_publisher_test COMMAND heartbeat_mq_publisher_test)
+        if (MSVC)
+            target_compile_options(heartbeat_mq_publisher_test PRIVATE /W4 /permissive-)
+        else()
+            target_compile_options(heartbeat_mq_publisher_test PRIVATE
+                -Wall -Wextra -Wpedantic)
+        endif()
+    endif()
+
+    install(TARGETS orbit_prediction_server orbit_mq_cli RUNTIME DESTINATION bin)
 
 endif()

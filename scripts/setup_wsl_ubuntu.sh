@@ -7,14 +7,11 @@ sudo apt-get install -y \
     cmake \
     ninja-build \
     pkg-config \
-    libprotobuf-dev \
-    protobuf-compiler \
-    libgrpc++-dev \
-    protobuf-compiler-grpc
+    qemu-user
 
 cmake -S . -B build-wsl -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCALGNSS_BUILD_GRPC=ON \
+    -DCALGNSS_BUILD_MQ=ON \
     -DCALGNSS_BUILD_TESTS=ON
 cmake --build build-wsl
 ctest --test-dir build-wsl --output-on-failure

@@ -1,5 +1,9 @@
 #include "orbit_prediction_engine.h"
 
+#ifdef ORBIT_ENABLE_RTCM_POSITIONING
+#include "rtcm_position_solver.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -335,6 +339,9 @@ OrbitPredictionEngine::OrbitPredictionEngine(EngineOptions options)
     if (!RecreateContext(&error)) {
         throw std::runtime_error(error);
     }
+#ifdef ORBIT_ENABLE_RTCM_POSITIONING
+    rtcm_position_solver_ = std::make_unique<RtcmPositionSolver>();
+#endif
 }
 
 OrbitPredictionEngine::~OrbitPredictionEngine()
@@ -525,6 +532,7 @@ bool OrbitPredictionEngine::ReceiveRTCMData(const std::string &data, std::string
     std::size_t accepted_frames = 0;
     std::size_t bad_crc_frames = 0;
     std::size_t discarded_bytes = 0;
+    std::size_t decoded_positions = 0;
     std::map<std::uint16_t, std::size_t> accepted_types;
     while (cursor < rtcm_input_buffer_.size()) {
         const auto preamble = std::find(rtcm_input_buffer_.begin() +
@@ -573,6 +581,35 @@ bool OrbitPredictionEngine::ReceiveRTCMData(const std::string &data, std::string
         std::vector<std::uint8_t> frame(
             rtcm_input_buffer_.begin() + static_cast<std::ptrdiff_t>(frame_begin),
             rtcm_input_buffer_.begin() + static_cast<std::ptrdiff_t>(frame_begin + frame_size));
+#ifdef ORBIT_ENABLE_RTCM_POSITIONING
+        std::vector<EcefPositionObservation> positions;
+        std::string solver_diagnostic;
+        // The protocol-level tests intentionally use a tiny CRC-valid frame.
+        // Do not pass structurally impossible payloads into the RTCM decoder.
+        if (payload_size >= 20) {
+            rtcm_position_solver_->FeedFrame(frame, &positions, &solver_diagnostic);
+        }
+        for (const auto &position : positions) {
+            has_latest_rtcm_observation_ = true;
+            latest_rtcm_observation_ms_ = position.timestamp_ms;
+            if (has_latest_observation_ && position.timestamp_ms <= latest_observation_ms_) {
+                continue;
+            }
+            cg_observation_t observation{};
+            observation.time_utc = MakeTime(position.timestamp_ms);
+            observation.r_ecef_m = {position.x_m, position.y_m, position.z_m};
+            const int push_status = cg_context_push(context_, &observation);
+            if (push_status != CG_OK) {
+                SetError(message, std::string("cannot store RTCM ECEF observation: ") +
+                                      cg_status_string(push_status));
+                return false;
+            }
+            has_latest_observation_ = true;
+            latest_observation_ms_ = position.timestamp_ms;
+            ++decoded_positions;
+            ++rtcm_solutions_received_;
+        }
+#endif
         if (payload_size >= 2) {
             const std::uint16_t message_type = static_cast<std::uint16_t>(
                 (static_cast<std::uint16_t>(frame[3]) << 4) | (frame[4] >> 4));
@@ -609,6 +646,10 @@ bool OrbitPredictionEngine::ReceiveRTCMData(const std::string &data, std::string
                 result << entry.first << 'x' << entry.second;
             }
         }
+#ifdef ORBIT_ENABLE_RTCM_POSITIONING
+        result << "; ECEF solutions=" << decoded_positions
+               << "; total ECEF observations=" << rtcm_solutions_received_;
+#endif
     } else if (!rtcm_input_buffer_.empty() && bad_crc_frames == 0) {
         result << "buffered " << rtcm_input_buffer_.size() << " byte(s) of a partial RTCM3 frame";
     } else {
@@ -645,6 +686,12 @@ bool OrbitPredictionEngine::Reset(std::string *error)
     rtcm_frames_.clear();
     rtcm_frame_bytes_ = 0;
     rtcm_frames_received_ = 0;
+    rtcm_solutions_received_ = 0;
+    has_latest_rtcm_observation_ = false;
+    latest_rtcm_observation_ms_ = 0;
+#ifdef ORBIT_ENABLE_RTCM_POSITIONING
+    rtcm_position_solver_->Reset();
+#endif
     stopped_.store(false, std::memory_order_release);
     if (error) {
         error->clear();
@@ -751,6 +798,22 @@ std::uint64_t OrbitPredictionEngine::RTCMFrameCount() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return rtcm_frames_received_;
+}
+
+std::uint64_t OrbitPredictionEngine::RTCMPositionCount() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return rtcm_solutions_received_;
+}
+
+bool OrbitPredictionEngine::LatestRTCMObservationTimestamp(
+    std::int64_t *timestamp_ms) const
+{
+    if (!timestamp_ms) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!has_latest_rtcm_observation_) return false;
+    *timestamp_ms = latest_rtcm_observation_ms_;
+    return true;
 }
 
 bool OrbitPredictionEngine::IsStopped() const

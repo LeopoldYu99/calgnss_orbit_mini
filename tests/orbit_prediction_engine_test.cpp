@@ -1,5 +1,6 @@
 #include "orbit_prediction_engine.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <iomanip>
@@ -82,6 +83,20 @@ int main()
     Require(predictions[1].timestamp_ms == 1782187454500LL,
             "fractional prediction steps must use millisecond timestamps");
 
+    std::vector<orbit_prediction::PredictionPoint> repeated_predictions;
+    Require(engine.PredictOrbit(1782187454LL, 2, 0.5,
+                [&repeated_predictions](const auto &batch) {
+                    repeated_predictions.insert(
+                        repeated_predictions.end(), batch.begin(), batch.end());
+                    return true;
+                },
+                []() { return false; }, &error),
+            "repeated orbit prediction: " + error);
+    Require(repeated_predictions.size() == predictions.size(),
+            "repeated prediction must stream the same number of points");
+    Require(std::fabs(repeated_predictions.back().x - predictions.back().x) < 1.0e-6,
+            "repeated prediction must restart its propagation cursor");
+
     engine.Stop();
     Require(engine.IsStopped(), "Stop must set stopped state");
     Require(!engine.PredictOrbit(1782187454LL, 2, 1.0, [](const auto &) { return true; },
@@ -92,6 +107,7 @@ int main()
     Require(!engine.IsStopped(), "Reset must clear stopped state");
     Require(engine.ObservationCount() == 0, "Reset must clear observations");
     Require(engine.RTCMFrameCount() == 0, "Reset must clear RTCM frames");
+    Require(engine.RTCMPositionCount() == 0, "Reset must clear RTCM positions");
     Require(!engine.ReceiveUplinkData(1, "", "not NMEA", &error),
             "invalid uplink data must be rejected");
 

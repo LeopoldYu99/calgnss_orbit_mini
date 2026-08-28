@@ -1970,6 +1970,13 @@ static int cg_extrapolate_future(
         out->time_utc = *query;
         return CG_OK;
     }
+    /* A new prediction request may start before the final point cached by the
+     * previous request.  Restart the propagation cursor once; otherwise every
+     * point in the new ascending sequence is propagated from the observation
+     * epoch, turning a repeated 3600-point request into quadratic work. */
+    if (query->unix_seconds < cache->last_state.time_utc.unix_seconds - 1.0e-9) {
+        cache->last_state = cache->latest_state;
+    }
     source = &cache->latest_state;
     if (query->unix_seconds >= cache->last_state.time_utc.unix_seconds - 1.0e-9) {
         source = &cache->last_state;

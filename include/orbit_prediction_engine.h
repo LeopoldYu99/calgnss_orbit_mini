@@ -8,11 +8,16 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
 namespace orbit_prediction {
+
+#ifdef ORBIT_ENABLE_RTCM_POSITIONING
+class RtcmPositionSolver;
+#endif
 
 struct PredictionPoint {
     std::int64_t timestamp_ms{};
@@ -27,7 +32,7 @@ struct PredictionPoint {
 struct EngineOptions {
     std::size_t observation_capacity{600};
     int fit_degree{10};
-    std::size_t stream_batch_size{10};
+    std::size_t stream_batch_size{100};
     std::size_t rtcm_cache_bytes{4 * 1024 * 1024};
 };
 
@@ -60,6 +65,8 @@ public:
 
     std::size_t ObservationCount() const;
     std::uint64_t RTCMFrameCount() const;
+    std::uint64_t RTCMPositionCount() const;
+    bool LatestRTCMObservationTimestamp(std::int64_t *timestamp_ms) const;
     bool IsStopped() const;
 
 private:
@@ -82,6 +89,12 @@ private:
     std::deque<std::vector<std::uint8_t>> rtcm_frames_;
     std::size_t rtcm_frame_bytes_{0};
     std::uint64_t rtcm_frames_received_{0};
+    std::uint64_t rtcm_solutions_received_{0};
+    bool has_latest_rtcm_observation_{false};
+    std::int64_t latest_rtcm_observation_ms_{0};
+#ifdef ORBIT_ENABLE_RTCM_POSITIONING
+    std::unique_ptr<RtcmPositionSolver> rtcm_position_solver_;
+#endif
 };
 
 }  // namespace orbit_prediction

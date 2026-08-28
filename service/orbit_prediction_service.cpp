@@ -1,120 +1,154 @@
 #include "orbit_prediction_service.h"
 
+#include <chrono>
 #include <iostream>
+#include <sstream>
 #include <utility>
 
 namespace orbit_prediction {
+namespace {
 
-OrbitPredictionServiceImpl::OrbitPredictionServiceImpl(EngineOptions options)
+constexpr double kPredictionStepSeconds = 1.0;
+
+std::int64_t CurrentTimestampMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+}  // namespace
+
+OrbitPredictionHandler::OrbitPredictionHandler(EngineOptions options)
     : engine_(std::move(options))
 {
 }
 
-grpc::Status OrbitPredictionServiceImpl::ReceiveUplinkData(
-    grpc::ServerContext *context, const UplinkPacket *request, CommonReply *reply)
+CommonReply OrbitPredictionHandler::Reply(bool success, const std::string &message)
 {
-    (void)context;
-    std::string error;
-    const bool success = request && engine_.ReceiveUplinkData(
-                                        request->port(), request->packet_header(), request->data(),
-                                        &error);
-    reply->set_success(success);
-    reply->set_message(success ? "uplink NMEA data accepted" :
-                                 (request ? error : "missing request"));
-    if (!success) {
-        std::cerr << "ReceiveUplinkData rejected: "
-                  << (request ? error : "missing request") << '\n';
-    }
-    return grpc::Status::OK;
+    CommonReply reply;
+    reply.timestamp_ms = CurrentTimestampMs();
+    reply.success = success;
+    reply.message = message;
+    return reply;
 }
 
-grpc::Status OrbitPredictionServiceImpl::ReceiveTimeSync(
-    grpc::ServerContext *context, const TimeSyncData *request, CommonReply *reply)
+CommonReply OrbitPredictionHandler::ReceiveUplinkData(const UplinkPacket &request)
 {
-    (void)context;
     std::string error;
-    const bool success = request && engine_.ReceiveTimeSync(request->timestamp_ms(), &error);
-    reply->set_success(success);
-    reply->set_message(success ? "time synchronization accepted" :
-                                 (request ? error : "missing request"));
+    const bool success = engine_.ReceiveUplinkData(
+        request.port, request.packet_header, request.data, &error);
     if (!success) {
-        std::cerr << "ReceiveTimeSync rejected: "
-                  << (request ? error : "missing request") << '\n';
+        std::cerr << "ReceiveUplinkData rejected: " << error << '\n';
     }
-    return grpc::Status::OK;
+    return Reply(success, success ? "uplink NMEA data accepted" : error);
 }
 
-grpc::Status OrbitPredictionServiceImpl::ReceiveRTCMData(
-    grpc::ServerContext *context, const RTCMData *request, CommonReply *reply)
+CommonReply OrbitPredictionHandler::ReceiveRTCMData(const RtcmData &request)
 {
-    (void)context;
     std::string message;
-    const bool success = request && engine_.ReceiveRTCMData(request->data(), &message);
-    reply->set_success(success);
-    reply->set_message(request ? message : "missing request");
+    const bool success = engine_.ReceiveRTCMData(request.data, &message);
     if (!success) {
-        std::cerr << "ReceiveRTCMData rejected: " << reply->message() << '\n';
+        std::cerr << "ReceiveRTCMData rejected: " << message << '\n';
     }
-    return grpc::Status::OK;
+    return Reply(success, message);
 }
 
-grpc::Status OrbitPredictionServiceImpl::Stop(
-    grpc::ServerContext *context, const google::protobuf::Empty *request, CommonReply *reply)
+StatusReply OrbitPredictionHandler::GetStatus() const
 {
-    (void)context;
-    (void)request;
+    StatusReply reply;
+    reply.timestamp_ms = CurrentTimestampMs();
+    std::ostringstream message;
+    if (prediction_running_.load(std::memory_order_acquire)) {
+        reply.status = ServiceStatus::Running;
+        message << "orbit prediction is running";
+    } else {
+        reply.status = ServiceStatus::Idle;
+        message << (engine_.IsStopped() ? "orbit prediction is stopped" :
+                                             "orbit prediction service is idle");
+    }
+    message << "; observations=" << engine_.ObservationCount()
+            << "; rtcm_frames=" << engine_.RTCMFrameCount()
+            << "; rtcm_positions=" << engine_.RTCMPositionCount();
+    reply.message = message.str();
+    return reply;
+}
+
+CommonReply OrbitPredictionHandler::Stop()
+{
     engine_.Stop();
-    reply->set_success(true);
-    reply->set_message("orbit prediction stopped");
-    return grpc::Status::OK;
+    return Reply(true, "orbit prediction stopped");
 }
 
-grpc::Status OrbitPredictionServiceImpl::Reset(
-    grpc::ServerContext *context, const google::protobuf::Empty *request, CommonReply *reply)
+CommonReply OrbitPredictionHandler::Reset()
 {
-    (void)context;
-    (void)request;
     std::string error;
     const bool success = engine_.Reset(&error);
-    reply->set_success(success);
-    reply->set_message(success ? "orbit prediction service reset" : error);
     if (!success) {
         std::cerr << "Reset failed: " << error << '\n';
     }
-    return grpc::Status::OK;
+    return Reply(success, success ? "orbit prediction service reset" : error);
 }
 
-grpc::Status OrbitPredictionServiceImpl::PredictOrbit(
-    grpc::ServerContext *context, const OrbitPredictionRequest *request,
-    grpc::ServerWriter<OrbitData> *writer)
+bool OrbitPredictionHandler::BeginPrediction()
 {
-    if (!request) {
-        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "missing request");
+    bool expected = false;
+    return prediction_running_.compare_exchange_strong(
+        expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+CommonReply OrbitPredictionHandler::RunPrediction(
+    const OrbitPredictionRequest &request, const BatchCallback &on_batch)
+{
+    if (!prediction_running_.load(std::memory_order_acquire)) {
+        return Reply(false, "prediction was not started");
     }
+    struct PredictionCompletion {
+        std::atomic<bool> &running;
+        ~PredictionCompletion()
+        {
+            running.store(false, std::memory_order_release);
+        }
+    } completion{prediction_running_};
+
+    std::int64_t latest_rtcm_timestamp_ms = 0;
+    if (!engine_.LatestRTCMObservationTimestamp(&latest_rtcm_timestamp_ms)) {
+        return Reply(false,
+                     "temporary RTCM test override requires at least one RTCM position");
+    }
+
+    // TEMPORARY TEST OVERRIDE: ignore MQ_METHOD_PREDICT_ORBIT.start_time_s and
+    // start at the timestamp of the most recently solved RTCM ECEF position.
+    // Remove this override after the RTCM/MQ field test is complete.
+    const std::int64_t rtcm_start_time_s = latest_rtcm_timestamp_ms / 1000;
+    std::cout << "TEMPORARY RTCM prediction-time override: requested_start_time_s="
+              << request.start_time_s << " rtcm_start_time_s=" << rtcm_start_time_s
+              << '\n';
+
     std::string error;
     const bool success = engine_.PredictOrbit(
-        request->start_time_s(), request->duration_s(), request->step_s(),
-        [writer](const std::vector<PredictionPoint> &batch) {
-            OrbitData response;
-            for (const auto &value : batch) {
-                OrbitPoint *point = response.add_points();
-                point->set_timestamp_ms(value.timestamp_ms);
-                point->set_x(value.x);
-                point->set_y(value.y);
-                point->set_z(value.z);
-                point->set_vx(value.vx);
-                point->set_vy(value.vy);
-                point->set_vz(value.vz);
+        rtcm_start_time_s, request.duration_s, kPredictionStepSeconds,
+        [&on_batch](const std::vector<PredictionPoint> &batch) {
+            if (on_batch) {
+                on_batch(batch);
             }
-            return writer->Write(response);
+            // MQ responses are best-effort. Missing responses do not make the
+            // underlying prediction calculation fail.
+            return true;
         },
-        [context]() { return context->IsCancelled(); }, &error);
+        [this]() { return engine_.IsStopped(); }, &error);
 
     if (!success) {
         std::cerr << "PredictOrbit failed: " << error << '\n';
-        return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, error);
+        return Reply(false, error);
     }
-    return grpc::Status::OK;
+    return Reply(true, engine_.IsStopped() ? "orbit prediction stopped" :
+                                               "orbit prediction completed");
+}
+
+bool OrbitPredictionHandler::IsPredictionRunning() const
+{
+    return prediction_running_.load(std::memory_order_acquire);
 }
 
 }  // namespace orbit_prediction

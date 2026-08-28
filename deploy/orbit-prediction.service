@@ -1,22 +1,23 @@
 [Unit]
-Description=Orbit Prediction gRPC microservice
-After=network-online.target
-Wants=network-online.target
+Description=Orbit Prediction POSIX MQ service
+After=dev-mqueue.mount
+Requires=dev-mqueue.mount
 
 [Service]
 Type=simple
 User=orbit
 Group=orbit
 EnvironmentFile=/etc/orbit-prediction.env
+ExecStartPre=+/bin/sh -c 'test ! -e /dev/mqueue/csm_main_to_end0 || chmod 0666 /dev/mqueue/csm_main_to_end0; test ! -e /dev/mqueue/csm_end0_to_main || chmod 0666 /dev/mqueue/csm_end0_to_main'
 ExecStart=/opt/orbit-prediction/bin/orbit_prediction_server
 Restart=on-failure
-RestartSec=2
+RestartSec=3s
 TimeoutStopSec=10
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0000
 
 [Install]
 WantedBy=multi-user.target

@@ -1,6 +1,6 @@
 # calgnss_orbit_mini
 
-gRPC 微服务、WSL2 构建和 Linux 部署说明请参阅 [README_GRPC.md](README_GRPC.md)。
+POSIX MQ 服务、WSL2 构建和 Linux 部署说明请参阅 [README_MQ.md](README_MQ.md)。
 
 `calgnss_orbit_mini` 是一个面向嵌入式/跨平台集成的 C 语言小型轨道拟合库。库接收按时间递增的 ECEF/ITRS 位置观测数据，在内部维护一段可配置长度的环形缓存，并根据用户查询时间输出 J2000 惯性坐标系下的位置和速度状态量。查询时间位于观测范围内时执行插值拟合，位于最新观测之后时支持短期未来轨道外推。
 

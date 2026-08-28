@@ -1,47 +1,36 @@
 #ifndef ORBIT_PREDICTION_SERVICE_H
 #define ORBIT_PREDICTION_SERVICE_H
 
-#include "orbit_prediction.grpc.pb.h"
 #include "orbit_prediction_engine.h"
+#include "orbit_mq_protocol.h"
+
+#include <atomic>
+#include <functional>
 
 namespace orbit_prediction {
 
-class OrbitPredictionServiceImpl final : public OrbitPredictionService::Service {
+class OrbitPredictionHandler final {
 public:
-    explicit OrbitPredictionServiceImpl(EngineOptions options = {});
+    using BatchCallback = std::function<void(const std::vector<PredictionPoint> &)>;
 
-    grpc::Status ReceiveUplinkData(
-        grpc::ServerContext *context,
-        const UplinkPacket *request,
-        CommonReply *reply) override;
+    explicit OrbitPredictionHandler(EngineOptions options = {});
 
-    grpc::Status ReceiveTimeSync(
-        grpc::ServerContext *context,
-        const TimeSyncData *request,
-        CommonReply *reply) override;
+    CommonReply ReceiveUplinkData(const UplinkPacket &request);
+    CommonReply ReceiveRTCMData(const RtcmData &request);
+    StatusReply GetStatus() const;
+    CommonReply Stop();
+    CommonReply Reset();
 
-    grpc::Status ReceiveRTCMData(
-        grpc::ServerContext *context,
-        const RTCMData *request,
-        CommonReply *reply) override;
-
-    grpc::Status Stop(
-        grpc::ServerContext *context,
-        const google::protobuf::Empty *request,
-        CommonReply *reply) override;
-
-    grpc::Status Reset(
-        grpc::ServerContext *context,
-        const google::protobuf::Empty *request,
-        CommonReply *reply) override;
-
-    grpc::Status PredictOrbit(
-        grpc::ServerContext *context,
-        const OrbitPredictionRequest *request,
-        grpc::ServerWriter<OrbitData> *writer) override;
+    bool BeginPrediction();
+    CommonReply RunPrediction(const OrbitPredictionRequest &request,
+                              const BatchCallback &on_batch);
+    bool IsPredictionRunning() const;
 
 private:
+    static CommonReply Reply(bool success, const std::string &message);
+
     OrbitPredictionEngine engine_;
+    std::atomic<bool> prediction_running_{false};
 };
 
 }  // namespace orbit_prediction
