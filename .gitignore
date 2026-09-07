@@ -1,12 +1,4 @@
-build/
-out/
-x64/
-Win32/
-.vs/
+build*/
+dist/
 *.user
-*.suo
-*.pdb
-*.obj
-*.ilk
-*.lib
-*.exe
+__pycache__/

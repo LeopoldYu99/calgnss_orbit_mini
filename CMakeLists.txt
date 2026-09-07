@@ -1,40 +1,65 @@
 cmake_minimum_required(VERSION 3.16)
-
-project(calgnss_orbit_mini C)
-
+project(orbit_determination VERSION 1.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+option(OD_BUILD_TESTS "Build pure C tests" ON)
+option(OD_BUILD_EXAMPLES "Build the C file replay example" ON)
+set(OD_RTCM_TEST_FILE "" CACHE FILEPATH "Optional real RTCM3 capture for replay test")
+find_package(Threads REQUIRED)
 
-set(CALGNSS_ORBIT_MINI_SOURCES
-    src/calgnss_orbit_mini.c
-)
-
-add_library(calgnss_orbit_mini SHARED
-    ${CALGNSS_ORBIT_MINI_SOURCES}
-)
-
-add_library(calgnss_orbit_mini_static STATIC
-    ${CALGNSS_ORBIT_MINI_SOURCES}
-)
-
-set_target_properties(calgnss_orbit_mini PROPERTIES
-    WINDOWS_EXPORT_ALL_SYMBOLS ON
-)
-
-set_target_properties(calgnss_orbit_mini_static PROPERTIES
-    OUTPUT_NAME calgnss_orbit_mini_static
-)
-
-target_include_directories(calgnss_orbit_mini PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-
-target_include_directories(calgnss_orbit_mini_static PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-
-if (UNIX)
-    target_link_libraries(calgnss_orbit_mini PUBLIC m)
-    target_link_libraries(calgnss_orbit_mini_static PUBLIC m)
+# All implementation, RTKLIB dependencies and EOP data live in this one C file.
+add_library(orbit_determination STATIC src/orbit_determination.c)
+add_library(od::orbit_determination ALIAS orbit_determination)
+set_target_properties(orbit_determination PROPERTIES OUTPUT_NAME od POSITION_INDEPENDENT_CODE ON)
+target_include_directories(orbit_determination PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+target_link_libraries(orbit_determination PUBLIC Threads::Threads)
+if(UNIX)
+    target_link_libraries(orbit_determination PUBLIC m)
+elseif(WIN32)
+    target_link_libraries(orbit_determination PUBLIC winmm ws2_32)
 endif()
+if(MSVC)
+    target_compile_options(orbit_determination PRIVATE /W4)
+else()
+    target_compile_options(orbit_determination PRIVATE -Wall -Wextra)
+endif()
+
+if(OD_BUILD_EXAMPLES)
+    add_executable(od_replay examples/od_replay.c)
+    target_link_libraries(od_replay PRIVATE orbit_determination)
+endif()
+if(OD_BUILD_TESTS)
+    enable_testing()
+    # Includes the implementation for private numerical boundary checks.
+    add_executable(od_test tests/orbit_test.c)
+    target_include_directories(od_test PRIVATE include)
+    target_link_libraries(od_test PRIVATE Threads::Threads)
+    if(UNIX)
+        target_link_libraries(od_test PRIVATE m)
+    elseif(WIN32)
+        target_link_libraries(od_test PRIVATE winmm ws2_32)
+    endif()
+    add_test(NAME od_api_test COMMAND od_test api)
+    add_test(NAME od_core_test COMMAND od_test core)
+    if(OD_RTCM_TEST_FILE)
+        add_test(NAME od_rtcm_capture COMMAND od_test rtcm ${OD_RTCM_TEST_FILE})
+    endif()
+endif()
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+install(TARGETS orbit_determination EXPORT odTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES include/orbit_determination.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES src/orbit_determination.c DESTINATION ${CMAKE_INSTALL_DATADIR}/od/src)
+install(EXPORT odTargets NAMESPACE od:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/od)
+configure_package_config_file(cmake/odConfig.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/odConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/od)
+write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/odConfigVersion.cmake
+    VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/odConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/odConfigVersion.cmake DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/od)
+install(FILES third_party/rtklib/readme.txt third_party/rtklib/LICENSE.txt
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/od/rtklib)
