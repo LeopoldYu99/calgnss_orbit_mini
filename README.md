@@ -12,12 +12,12 @@
 
 ```sh
 gcc -std=c99 -O2 -Iinclude src/orbit_determination.c examples/od_replay.c \
-    -lm -pthread -o od_replay
-./od_replay rtcm /path/to/capture.rtcm3 3
-./od_replay nmea /path/to/nmea.log 3
+    -lm -o od_replay
+./od_replay rtcm /path/to/capture.rtcm3 30
+./od_replay nmea /path/to/nmea.log 30
 ```
 
-回放示例从文件读数据，输出最后一个状态的 CSV。文件和通信收发由外部调用程序处理，库的输入接口接收字节。
+回放示例从文件读数据，输出最后一个状态的 CSV。省略点数参数时使用默认 30 点、三次拟合；指定点数时至少为 4，拟合阶数仍为 3。文件和通信收发由外部调用程序处理，库的输入接口接收字节。
 
 也可构建静态库：
 
@@ -29,6 +29,29 @@ cmake --install build-c --prefix "$PWD/dist/linux-x86_64"
 ```
 
 不需要联网下载依赖。CMake 项目只声明 `LANGUAGES C`。
+
+### 不支持 `dirent.h` 的平台
+
+源码默认 `OD_ENABLE_DIRECTORY_SCAN=0`，不包含 `dirent.h`，也不调用 `opendir/readdir/closedir`。NMEA 和 RTCM 字节流定轨不使用目录扫描，无需在硬件工程里添加此头文件或替代实现。
+
+内嵌 RTKLIB 的旧文件路径辅助函数在此模式下只接受明确文件名，不展开 `*`/`?` 通配符。桌面平台确需使用这些辅助函数时，可在编译整个实现文件时定义 `OD_ENABLE_DIRECTORY_SCAN=1`。
+
+### FreeRTOS / 裸机编译
+
+源码默认采用 FreeRTOS / 裸机行为，无需定义平台宏。默认不依赖 pthread、Windows API、目录扫描、`sys/time.h`、`sys/stat.h`，不调用系统时钟、休眠、shell 或目录创建接口，也不开启 RTKLIB 文件跟踪日志。桌面编译使用相同行为；输入时间仍由 NMEA/RTCM 数据提供。
+
+GCC 类工具链的源码编译示意（将 `gcc` 换成板卡交叉编译器，补充芯片参数）：
+
+```sh
+gcc -std=c99 -O2 -ffunction-sections -fdata-sections \
+    -Iinclude -c src/orbit_determination.c -o orbit_determination.o
+```
+
+固件链接时加入 `orbit_determination.o`、数学库 `-lm` 和 `-Wl,--gc-sections`，清除不使用的内嵌 RTKLIB 文件辅助函数；无需 `-pthread`。标准 C 运行库仍需提供内存分配、字符串/数值转换、格式化和数学函数，浮点运算使用 `double`。源码不自动将 `malloc/free` 映射到 FreeRTOS 堆接口。
+
+使用 CMake 时，在配置工具链的同时添加 `-DOD_BUILD_EXAMPLES=OFF -DOD_BUILD_TESTS=OFF`；嵌入式库不查找或链接 Threads。仓库中的 `dist/linux-x86_64/lib/libod.a` 仍是 Linux 库，硬件需用自己的工具链重新编译源码。
+
+NMEA 时间由 RMC/GGA 或显式参考时间提供；GPS/北斗 RTCM 时间继续由输入星历与观测提供，不需要 FreeRTOS 提供当前日期。一个实例应由单个任务调用；多个 RTCM 实例也应串行解码。库不增加内部互斥锁，不改变默认 30 点、三次拟合。
 
 ## 接口
 
@@ -47,8 +70,8 @@ cmake --install build-c --prefix "$PWD/dist/linux-x86_64"
 
 ```c
 od_config_t config = od_default_config();
-config.observation_capacity = 3; /* 环形队列最多保留 3 个位置观测点 */
-config.fit_degree = 2;          /* 二次拟合 */
+config.observation_capacity = 30; /* 环形队列最多保留 30 个位置观测点 */
+config.fit_degree = 3;           /* 三次拟合 */
 
 od_context_t *ctx = NULL;
 od_status_t status = od_create(&config, &ctx);
@@ -68,16 +91,16 @@ od_destroy(ctx);
 
 | 字段 | 默认值 | 说明 |
 |---|---:|---|
-| `observation_capacity` | 3 | 环形位置观测队列点数，2～65536；满后淘汰最旧点 |
-| `fit_degree` | 2 | 拟合阶数，1～16，必须小于容量 |
+| `observation_capacity` | 30 | 环形位置观测队列点数，2～65536；满后淘汰最旧点 |
+| `fit_degree` | 3 | 拟合阶数，1～16，必须小于容量 |
 | `nmea_reference_utc_ms` | -1 | 无 RMC 时的 UTC 毫秒参考；-1 表示需要 RMC 日期 |
 | `gps_week_rollover` | 2048 | RTCM 1019 的 GPS 周年代偏移，1024 的整数倍，0～8192 |
 
-从 `od_default_config()` 初始化配置后再修改字段。至少 `fit_degree + 1` 个有效观测才可输出，不必等队列填满。
+从 `od_default_config()` 初始化配置后再修改字段。至少 `fit_degree + 1` 个有效观测才可输出，默认第 4 个有效观测开始输出，不必等 30 点队列填满。`od_create(NULL, &ctx)` 同样使用此默认配置，适用于 NMEA 和 RTCM。
 
-在最新观测时间，对队列内全部点做切比雪夫多项式最小二乘拟合，求位置和一阶导数。点间隔可不均匀，时间必须严格递增。三点二次拟合是精简配置，不表示它已经满足某个实测速度精度指标；位置噪声、采样间隔和窗口长度都会影响估速。
+在最新观测时间，对队列内全部点做切比雪夫多项式最小二乘拟合，求位置和一阶导数。点间隔可不均匀，时间必须严格递增。默认使用 30 点三次拟合；位置噪声、采样间隔和窗口长度都会影响估速。需要三点二次拟合时，应同时显式设置容量为 3、阶数为 2。
 
-位置队列按容量分配。NMEA 使用固定 1025 字节语句缓冲，RTCM 使用固定 1029 字节组帧缓冲；RTKLIB 解码器在首次非空 RTCM 输入时创建，并另行保留星历与当前观测历元。因此 RTCM 模式的总内存不只有三个位置信息点的大小。reset 会释放 RTCM 解码器，destroy 释放所有实例资源。
+位置队列按容量分配。NMEA 使用固定 1025 字节语句缓冲，RTCM 使用固定 1029 字节组帧缓冲；RTKLIB 解码器在首次非空 RTCM 输入时创建，并另行保留星历与当前观测历元。因此 RTCM 模式的总内存还包括位置队列之外的解码与定位状态。reset 会释放 RTCM 解码器，destroy 释放所有实例资源。
 
 ## 数据约定
 
@@ -104,7 +127,7 @@ Linux 安装包在 `dist/linux-x86_64`，包括 `lib/libod.a`、对外头文件�
 
 ```sh
 gcc -std=c99 -I/path/to/od/include app.c /path/to/od/lib/libod.a \
-    -lm -pthread -o app
+    -lm -o app
 ```
 
 CMake 调用方式：`find_package(od CONFIG REQUIRED)`，然后 `target_link_libraries(app PRIVATE od::orbit_determination)`。独立示例：

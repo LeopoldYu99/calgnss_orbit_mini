@@ -23,9 +23,9 @@ enum {
 
 typedef struct od_config {
     /* Ring capacity in position observations, NOT bytes. Range: 2..65536.
-       Once full, each new observation replaces the oldest. Default: 3. */
+       Once full, each new observation replaces the oldest. Default: 30. */
     uint32_t observation_capacity;
-    /* Polynomial degree: 1..16, strictly less than capacity. Default: 2.
+    /* Polynomial degree: 1..16, strictly less than capacity. Default: 3.
        Output becomes ready after fit_degree + 1 observations. */
     uint32_t fit_degree;
     /* UTC Unix milliseconds for resolving GGA time without RMC.

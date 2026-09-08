@@ -6,8 +6,6 @@ set(CMAKE_C_EXTENSIONS OFF)
 option(OD_BUILD_TESTS "Build pure C tests" ON)
 option(OD_BUILD_EXAMPLES "Build the C file replay example" ON)
 set(OD_RTCM_TEST_FILE "" CACHE FILEPATH "Optional real RTCM3 capture for replay test")
-find_package(Threads REQUIRED)
-
 # All implementation, RTKLIB dependencies and EOP data live in this one C file.
 add_library(orbit_determination STATIC src/orbit_determination.c)
 add_library(od::orbit_determination ALIAS orbit_determination)
@@ -15,11 +13,8 @@ set_target_properties(orbit_determination PROPERTIES OUTPUT_NAME od POSITION_IND
 target_include_directories(orbit_determination PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_link_libraries(orbit_determination PUBLIC Threads::Threads)
 if(UNIX)
     target_link_libraries(orbit_determination PUBLIC m)
-elseif(WIN32)
-    target_link_libraries(orbit_determination PUBLIC winmm ws2_32)
 endif()
 if(MSVC)
     target_compile_options(orbit_determination PRIVATE /W4)
@@ -36,11 +31,8 @@ if(OD_BUILD_TESTS)
     # Includes the implementation for private numerical boundary checks.
     add_executable(od_test tests/orbit_test.c)
     target_include_directories(od_test PRIVATE include)
-    target_link_libraries(od_test PRIVATE Threads::Threads)
     if(UNIX)
         target_link_libraries(od_test PRIVATE m)
-    elseif(WIN32)
-        target_link_libraries(od_test PRIVATE winmm ws2_32)
     endif()
     add_test(NAME od_api_test COMMAND od_test api)
     add_test(NAME od_core_test COMMAND od_test core)

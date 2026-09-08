@@ -25,7 +25,7 @@ int main(int argc, char **argv)
     if (argc == 4) {
         char *end;
         unsigned long capacity = strtoul(argv[3], &end, 10);
-        if (!argv[3][0] || *end || capacity < 3 || capacity > 65536) return 2;
+        if (!argv[3][0] || *end || capacity <= config.fit_degree || capacity > 65536) return 2;
         config.observation_capacity = (uint32_t)capacity;
     }
     status = od_create(&config, &ctx);

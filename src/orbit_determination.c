@@ -3,12 +3,24 @@
  * All implementation dependencies and EOP data are embedded below.
  * RTKLIB copyright/license: see embedded notice and third_party/rtklib/LICENSE.txt.
  */
-#ifndef _DEFAULT_SOURCE
-#define _DEFAULT_SOURCE
+#if OD_ENABLE_DIRECTORY_SCAN
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #endif
 #include "orbit_determination.h"
 #include <errno.h>
 #include <limits.h>
+/* Portable profile: standard C runtime and libm only; no OS services. */
+/* Streaming OD does not need RTKLIB's legacy directory scanning helpers.
+ * Set to 1 only on hosts providing directory APIs if wildcard file loading
+ * through the embedded RTKLIB helpers is required. */
+#ifndef OD_ENABLE_DIRECTORY_SCAN
+#define OD_ENABLE_DIRECTORY_SCAN 0
+#endif
+#if OD_ENABLE_DIRECTORY_SCAN
+#include <dirent.h>
+#endif
 /* Extracted from PredictOrbit: coordinate conversion and fitting only. */
 typedef struct od_fit_time_t {
     int year;
@@ -1407,7 +1419,6 @@ license.
 *           -DNFREQ=n  set number of obs codes/frequencies
 *           -DNEXOBS=n set number of extended obs codes
 *           -DMAXOBS=n set max number of obs data in an epoch
-*           -DWIN32    use WIN32 API
 *           -DWIN_DLL  generate library as Windows DLL
 *
 * version : $Revision:$ $Date:$
@@ -1434,13 +1445,6 @@ license.
 #include <time.h>
 #include <ctype.h>
 #include <stdint.h>
-#ifdef WIN32
-#include <winsock2.h>
-#include <windows.h>
-#else
-#include <pthread.h>
-#include <sys/select.h>
-#endif
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -1906,21 +1910,15 @@ extern "C" {
 #define P2_50       8.881784197001252E-16 /* 2^-50 */
 #define P2_55       2.775557561562891E-17 /* 2^-55 */
 
-#ifdef WIN32
-#define thread_t    HANDLE
-#define lock_t      CRITICAL_SECTION
-#define initlock(f) InitializeCriticalSection(f)
-#define lock(f)     EnterCriticalSection(f)
-#define unlock(f)   LeaveCriticalSection(f)
-#define FILEPATHSEP '\\'
-#else
-#define thread_t    pthread_t
-#define lock_t      pthread_mutex_t
-#define initlock(f) pthread_mutex_init(f,NULL)
-#define lock(f)     pthread_mutex_lock(f)
-#define unlock(f)   pthread_mutex_unlock(f)
+/* Layout placeholders for unused RTKLIB server/stream declarations. OD does
+ * not create threads or locks; callers serialize all access. This also keeps
+ * the standalone source independent of pthread on desktop POSIX systems. */
+#define thread_t    uintptr_t
+#define lock_t      unsigned int
+#define initlock(f) ((void)(f))
+#define lock(f)     ((void)(f))
+#define unlock(f)   ((void)(f))
 #define FILEPATHSEP '/'
-#endif
 
 /* type definitions ----------------------------------------------------------*/
 
@@ -3221,7 +3219,6 @@ extern void settime(gtime_t time);
 * options : -DLAPACK   use LAPACK/BLAS
 *           -DMKL      use Intel MKL
 *           -DTRACE    enable debug trace
-*           -DWIN32    use WIN32 API
 *           -DNOCALLOC no use calloc for zero matrix
 *           -DIERS_MODEL use GMF instead of NMF
 *           -DDLL      built for shared library
@@ -3358,17 +3355,9 @@ extern void settime(gtime_t time);
 *                           use integer types in stdint.h
 *                           surppress warnings
 *-----------------------------------------------------------------------------*/
-#define _POSIX_C_SOURCE 199506
 #include <stdarg.h>
 #include <ctype.h>
 #include <errno.h>
-#ifndef WIN32
-#include <dirent.h>
-#include <time.h>
-#include <sys/time.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#endif
 
 /* constants -----------------------------------------------------------------*/
 
@@ -4797,29 +4786,10 @@ static double od_rtk_rtkcmn_timeoffset_=0.0;        /* time offset (s) */
 
 extern gtime_t timeget(void)
 {
-    gtime_t time;
-    double ep[6]={0};
-#ifdef WIN32
-    SYSTEMTIME ts;
-    
-    GetSystemTime(&ts); /* utc */
-    ep[0]=ts.wYear; ep[1]=ts.wMonth;  ep[2]=ts.wDay;
-    ep[3]=ts.wHour; ep[4]=ts.wMinute; ep[5]=ts.wSecond+ts.wMilliseconds*1E-3;
-#else
-    struct timeval tv;
-    struct tm *tt;
-    
-    if (!gettimeofday(&tv,NULL)&&(tt=gmtime(&tv.tv_sec))) {
-        ep[0]=tt->tm_year+1900; ep[1]=tt->tm_mon+1; ep[2]=tt->tm_mday;
-        ep[3]=tt->tm_hour; ep[4]=tt->tm_min; ep[5]=tt->tm_sec+tv.tv_usec*1E-6;
-    }
-#endif
-    time=epoch2time(ep);
-    
-#ifdef CPUTIME_IN_GPST /* cputime operated in gpst */
-    time=gpst2utc(time);
-#endif
-    return timeadd(time,od_rtk_rtkcmn_timeoffset_);
+    /* No wall-clock source. Public OD resolves epochs from input messages and
+     * corrects supported GPS/BDS ephemeris weeks, never from this fallback. */
+    gtime_t unavailable = {0,0};
+    return unavailable;
 }
 /* set current time in utc -----------------------------------------------------
 * set current time in utc
@@ -5061,26 +5031,7 @@ extern int adjgpsweek(int week)
 *-----------------------------------------------------------------------------*/
 extern uint32_t tickget(void)
 {
-#ifdef WIN32
-    return (uint32_t)timeGetTime();
-#else
-    struct timespec tp={0};
-    struct timeval  tv={0};
-    
-#ifdef CLOCK_MONOTONIC_RAW
-    /* linux kernel > 2.6.28 */
-    if (!clock_gettime(CLOCK_MONOTONIC_RAW,&tp)) {
-        return tp.tv_sec*1000u+tp.tv_nsec/1000000u;
-    }
-    else {
-        gettimeofday(&tv,NULL);
-        return tv.tv_sec*1000u+tv.tv_usec/1000u;
-    }
-#else
-    gettimeofday(&tv,NULL);
-    return tv.tv_sec*1000u+tv.tv_usec/1000u;
-#endif
-#endif /* WIN32 */
+    return 0; /* Legacy diagnostics only; not used by OD fitting. */
 }
 /* sleep ms --------------------------------------------------------------------
 * sleep ms
@@ -5089,15 +5040,7 @@ extern uint32_t tickget(void)
 *-----------------------------------------------------------------------------*/
 extern void sleepms(int ms)
 {
-#ifdef WIN32
-    if (ms<5) Sleep(1); else Sleep(ms);
-#else
-    struct timespec ts;
-    if (ms<=0) return;
-    ts.tv_sec=(time_t)(ms/1000);
-    ts.tv_nsec=(long)(ms%1000*1000000);
-    nanosleep(&ts,NULL);
-#endif
+    (void)ms; /* OD has no background tasks or sleep operations. */
 }
 /* convert degree to deg-min-sec -----------------------------------------------
 * convert degree to degree-minute-second
@@ -6234,200 +6177,6 @@ extern void freenav(nav_t *nav, int opt)
     if (opt&0x40) {free(nav->tec ); nav->tec =NULL; nav->nt=nav->ntmax=0;}
 }
 /* debug trace functions -----------------------------------------------------*/
-#ifdef TRACE
-
-static FILE *od_rtk_rtkcmn_fp_trace=NULL;     /* file pointer of trace */
-static char od_rtk_rtkcmn_file_trace[1024];   /* trace file */
-static int od_rtk_rtkcmn_level_trace=0;       /* level of trace */
-static uint32_t od_rtk_rtkcmn_tick_trace=0;   /* tick time at traceopen (ms) */
-static gtime_t od_rtk_rtkcmn_time_trace={0};  /* time at traceopen */
-static lock_t od_rtk_rtkcmn_lock_trace;       /* lock for trace */
-
-static void od_rtk_rtkcmn_traceswap(void)
-{
-    gtime_t time=utc2gpst(timeget());
-    char path[1024];
-    
-    lock(&od_rtk_rtkcmn_lock_trace);
-    
-    if ((int)(time2gpst(time      ,NULL)/INT_SWAP_TRAC)==
-        (int)(time2gpst(od_rtk_rtkcmn_time_trace,NULL)/INT_SWAP_TRAC)) {
-        unlock(&od_rtk_rtkcmn_lock_trace);
-        return;
-    }
-    od_rtk_rtkcmn_time_trace=time;
-    
-    if (!reppath(od_rtk_rtkcmn_file_trace,path,time,"","")) {
-        unlock(&od_rtk_rtkcmn_lock_trace);
-        return;
-    }
-    if (od_rtk_rtkcmn_fp_trace) fclose(od_rtk_rtkcmn_fp_trace);
-    
-    if (!(od_rtk_rtkcmn_fp_trace=fopen(path,"w"))) {
-        od_rtk_rtkcmn_fp_trace=stderr;
-    }
-    unlock(&od_rtk_rtkcmn_lock_trace);
-}
-extern void traceopen(const char *file)
-{
-    gtime_t time=utc2gpst(timeget());
-    char path[1024];
-    
-    reppath(file,path,time,"","");
-    if (!*path||!(od_rtk_rtkcmn_fp_trace=fopen(path,"w"))) od_rtk_rtkcmn_fp_trace=stderr;
-    strcpy(od_rtk_rtkcmn_file_trace,file);
-    od_rtk_rtkcmn_tick_trace=tickget();
-    od_rtk_rtkcmn_time_trace=time;
-    initlock(&od_rtk_rtkcmn_lock_trace);
-}
-extern void traceclose(void)
-{
-    if (od_rtk_rtkcmn_fp_trace&&od_rtk_rtkcmn_fp_trace!=stderr) fclose(od_rtk_rtkcmn_fp_trace);
-    od_rtk_rtkcmn_fp_trace=NULL;
-    od_rtk_rtkcmn_file_trace[0]='\0';
-}
-extern void tracelevel(int level)
-{
-    od_rtk_rtkcmn_level_trace=level;
-}
-extern void trace(int level, const char *format, ...)
-{
-    va_list ap;
-    
-    /* print error message to stderr */
-    if (level<=1) {
-        va_start(ap,format); vfprintf(stderr,format,ap); va_end(ap);
-    }
-    if (!od_rtk_rtkcmn_fp_trace||level>od_rtk_rtkcmn_level_trace) return;
-    od_rtk_rtkcmn_traceswap();
-    fprintf(od_rtk_rtkcmn_fp_trace,"%d ",level);
-    va_start(ap,format); vfprintf(od_rtk_rtkcmn_fp_trace,format,ap); va_end(ap);
-    fflush(od_rtk_rtkcmn_fp_trace);
-}
-extern void tracet(int level, const char *format, ...)
-{
-    va_list ap;
-    
-    if (!od_rtk_rtkcmn_fp_trace||level>od_rtk_rtkcmn_level_trace) return;
-    od_rtk_rtkcmn_traceswap();
-    fprintf(od_rtk_rtkcmn_fp_trace,"%d %9.3f: ",level,(tickget()-od_rtk_rtkcmn_tick_trace)/1000.0);
-    va_start(ap,format); vfprintf(od_rtk_rtkcmn_fp_trace,format,ap); va_end(ap);
-    fflush(od_rtk_rtkcmn_fp_trace);
-}
-extern void tracemat(int level, const double *A, int n, int m, int p, int q)
-{
-    if (!od_rtk_rtkcmn_fp_trace||level>od_rtk_rtkcmn_level_trace) return;
-    matfprint(A,n,m,p,q,od_rtk_rtkcmn_fp_trace); fflush(od_rtk_rtkcmn_fp_trace);
-}
-extern void traceobs(int level, const obsd_t *obs, int n)
-{
-    char str[64],id[16];
-    int i;
-    
-    if (!od_rtk_rtkcmn_fp_trace||level>od_rtk_rtkcmn_level_trace) return;
-    for (i=0;i<n;i++) {
-        time2str(obs[i].time,str,3);
-        satno2id(obs[i].sat,id);
-        fprintf(od_rtk_rtkcmn_fp_trace," (%2d) %s %-3s rcv%d %13.3f %13.3f %13.3f %13.3f %d %d %d %d %3.1f %3.1f\n",
-              i+1,str,id,obs[i].rcv,obs[i].L[0],obs[i].L[1],obs[i].P[0],
-              obs[i].P[1],obs[i].LLI[0],obs[i].LLI[1],obs[i].code[0],
-              obs[i].code[1],obs[i].SNR[0]*SNR_UNIT,obs[i].SNR[1]*SNR_UNIT);
-    }
-    fflush(od_rtk_rtkcmn_fp_trace);
-}
-extern void tracenav(int level, const nav_t *nav)
-{
-    char s1[64],s2[64],id[16];
-    int i;
-    
-    if (!od_rtk_rtkcmn_fp_trace||level>od_rtk_rtkcmn_level_trace) return;
-    for (i=0;i<nav->n;i++) {
-        time2str(nav->eph[i].toe,s1,0);
-        time2str(nav->eph[i].ttr,s2,0);
-        satno2id(nav->eph[i].sat,id);
-        fprintf(od_rtk_rtkcmn_fp_trace,"(%3d) %-3s : %s %s %3d %3d %02x\n",i+1,
-                id,s1,s2,nav->eph[i].iode,nav->eph[i].iodc,nav->eph[i].svh);
-    }
-    fprintf(od_rtk_rtkcmn_fp_trace,"(ion) %9.4e %9.4e %9.4e %9.4e\n",nav->ion_gps[0],
-            nav->ion_gps[1],nav->ion_gps[2],nav->ion_gps[3]);
-    fprintf(od_rtk_rtkcmn_fp_trace,"(ion) %9.4e %9.4e %9.4e %9.4e\n",nav->ion_gps[4],
-            nav->ion_gps[5],nav->ion_gps[6],nav->ion_gps[7]);
-    fprintf(od_rtk_rtkcmn_fp_trace,"(ion) %9.4e %9.4e %9.4e %9.4e\n",nav->ion_gal[0],
-            nav->ion_gal[1],nav->ion_gal[2],nav->ion_gal[3]);
-}
-extern void tracegnav(int level, const nav_t *nav)
-{
-    char s1[64],s2[64],id[16];
-    int i;
-    
-    if (!od_rtk_rtkcmn_fp_trace||level>od_rtk_rtkcmn_level_trace) return;
-    for (i=0;i<nav->ng;i++) {
-        time2str(nav->geph[i].toe,s1,0);
-        time2str(nav->geph[i].tof,s2,0);
-        satno2id(nav->geph[i].sat,id);
-        fprintf(od_rtk_rtkcmn_fp_trace,"(%3d) %-3s : %s %s %2d %2d %8.3f\n",i+1,
-                id,s1,s2,nav->geph[i].frq,nav->geph[i].svh,nav->geph[i].taun*1E6);
-    }
-}
-extern void tracehnav(int level, const nav_t *nav)
-{
-    char s1[64],s2[64],id[16];
-    int i;
-    
-    if (!od_rtk_rtkcmn_fp_trace||level>od_rtk_rtkcmn_level_trace) return;
-    for (i=0;i<nav->ns;i++) {
-        time2str(nav->seph[i].t0,s1,0);
-        time2str(nav->seph[i].tof,s2,0);
-        satno2id(nav->seph[i].sat,id);
-        fprintf(od_rtk_rtkcmn_fp_trace,"(%3d) %-3s : %s %s %2d %2d\n",i+1,
-                id,s1,s2,nav->seph[i].svh,nav->seph[i].sva);
-    }
-}
-extern void tracepeph(int level, const nav_t *nav)
-{
-    char s[64],id[16];
-    int i,j;
-    
-    if (!od_rtk_rtkcmn_fp_trace||level>od_rtk_rtkcmn_level_trace) return;
-    
-    for (i=0;i<nav->ne;i++) {
-        time2str(nav->peph[i].time,s,0);
-        for (j=0;j<MAXSAT;j++) {
-            satno2id(j+1,id);
-            fprintf(od_rtk_rtkcmn_fp_trace,"%-3s %d %-3s %13.3f %13.3f %13.3f %13.3f %6.3f %6.3f %6.3f %6.3f\n",
-                    s,nav->peph[i].index,id,
-                    nav->peph[i].pos[j][0],nav->peph[i].pos[j][1],
-                    nav->peph[i].pos[j][2],nav->peph[i].pos[j][3]*1E9,
-                    nav->peph[i].std[j][0],nav->peph[i].std[j][1],
-                    nav->peph[i].std[j][2],nav->peph[i].std[j][3]*1E9);
-        }
-    }
-}
-extern void tracepclk(int level, const nav_t *nav)
-{
-    char s[64],id[16];
-    int i,j;
-    
-    if (!od_rtk_rtkcmn_fp_trace||level>od_rtk_rtkcmn_level_trace) return;
-    
-    for (i=0;i<nav->nc;i++) {
-        time2str(nav->pclk[i].time,s,0);
-        for (j=0;j<MAXSAT;j++) {
-            satno2id(j+1,id);
-            fprintf(od_rtk_rtkcmn_fp_trace,"%-3s %d %-3s %13.3f %6.3f\n",
-                    s,nav->pclk[i].index,id,
-                    nav->pclk[i].clk[j][0]*1E9,nav->pclk[i].std[j][0]*1E9);
-        }
-    }
-}
-extern void traceb(int level, const uint8_t *p, int n)
-{
-    int i;
-    if (!od_rtk_rtkcmn_fp_trace||level>od_rtk_rtkcmn_level_trace) return;
-    for (i=0;i<n;i++) fprintf(od_rtk_rtkcmn_fp_trace,"%02X%s",*p++,i%8==7?" ":"");
-    fprintf(od_rtk_rtkcmn_fp_trace,"\n");
-}
-#else
 extern void traceopen(const char *file) {}
 extern void traceclose(void) {}
 extern void tracelevel(int level) {}
@@ -6442,7 +6191,6 @@ extern void tracepeph(int level, const nav_t *nav) {}
 extern void tracepclk(int level, const nav_t *nav) {}
 extern void traceb  (int level, const uint8_t *p, int n) {}
 
-#endif /* TRACE */
 
 /* execute command -------------------------------------------------------------
 * execute command line by operating system shell
@@ -6451,28 +6199,8 @@ extern void traceb  (int level, const uint8_t *p, int n) {}
 *-----------------------------------------------------------------------------*/
 extern int execcmd(const char *cmd)
 {
-#ifdef WIN32
-    PROCESS_INFORMATION info;
-    STARTUPINFO si={0};
-    DWORD stat;
-    char cmds[1024];
-    
-    trace(3,"execcmd: cmd=%s\n",cmd);
-    
-    si.cb=sizeof(si);
-    sprintf(cmds,"cmd /c %s",cmd);
-    if (!CreateProcess(NULL,(LPTSTR)cmds,NULL,NULL,FALSE,CREATE_NO_WINDOW,NULL,
-                       NULL,&si,&info)) return -1;
-    WaitForSingleObject(info.hProcess,INFINITE);
-    if (!GetExitCodeProcess(info.hProcess,&stat)) stat=-1;
-    CloseHandle(info.hProcess);
-    CloseHandle(info.hThread);
-    return (int)stat;
-#else
-    trace(3,"execcmd: cmd=%s\n",cmd);
-    
-    return system(cmd);
-#endif
+    (void)cmd;
+    return -1; /* Shell execution unavailable. */
 }
 /* expand file path ------------------------------------------------------------
 * expand file path with wild-card (*) in file
@@ -6484,29 +6212,16 @@ extern int execcmd(const char *cmd)
 *-----------------------------------------------------------------------------*/
 extern int expath(const char *path, char *paths[], int nmax)
 {
+#if !OD_ENABLE_DIRECTORY_SCAN
+    /* No directory API: accept an explicit filename, never expand wildcards.
+     * Legacy RTKLIB callers allocate 1024-byte path buffers. */
+    if (!path || !paths || nmax <= 0 || !paths[0] || !*path ||
+        strlen(path) >= 1024 || strpbrk(path, "*?")) return 0;
+    strcpy(paths[0], path);
+    return 1;
+#else
     int i,j,n=0;
     char tmp[1024];
-#ifdef WIN32
-    WIN32_FIND_DATA file;
-    HANDLE h;
-    char dir[1024]="",*p;
-    
-    trace(3,"expath  : path=%s nmax=%d\n",path,nmax);
-    
-    if ((p=strrchr(path,'\\'))) {
-        strncpy(dir,path,p-path+1); dir[p-path+1]='\0';
-    }
-    if ((h=FindFirstFile((LPCTSTR)path,&file))==INVALID_HANDLE_VALUE) {
-        strcpy(paths[0],path);
-        return 1;
-    }
-    sprintf(paths[n++],"%s%s",dir,file.cFileName);
-    while (FindNextFile(h,&file)&&n<nmax) {
-        if (file.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) continue;
-        sprintf(paths[n++],"%s%s",dir,file.cFileName);
-    }
-    FindClose(h);
-#else
     struct dirent *d;
     DIR *dp;
     const char *file=path;
@@ -6531,7 +6246,6 @@ extern int expath(const char *path, char *paths[], int nmax)
         if (p&&n<nmax) sprintf(paths[n++],"%s%s",dir,d->d_name);
     }
     closedir(dp);
-#endif
     /* sort paths in alphabetical order */
     for (i=0;i<n-1;i++) {
         for (j=i+1;j<n;j++) {
@@ -6545,47 +6259,13 @@ extern int expath(const char *path, char *paths[], int nmax)
     for (i=0;i<n;i++) trace(3,"expath  : file=%s\n",paths[i]);
     
     return n;
+#endif
 }
 /* generate local directory recursively --------------------------------------*/
 static int od_rtk_rtkcmn_mkdir_r(const char *dir)
 {
-    char pdir[1024],*p;
-
-#ifdef WIN32
-    HANDLE h;
-    WIN32_FIND_DATA data;
-    
-    if (!*dir||!strcmp(dir+1,":\\")) return 1;
-    
-    sprintf(pdir,"%.1023s",dir);
-    if ((p=strrchr(pdir,FILEPATHSEP))) {
-        *p='\0';
-        h=FindFirstFile(pdir,&data);
-        if (h==INVALID_HANDLE_VALUE) {
-            if (!od_rtk_rtkcmn_mkdir_r(pdir)) return 0;
-        }
-        else FindClose(h);
-    }
-    if (CreateDirectory(dir,NULL)||GetLastError()==ERROR_ALREADY_EXISTS) {
-        return 1;
-    }
-#else
-    FILE *fp;
-    
-    if (!*dir) return 1;
-    
-    sprintf(pdir,"%.1023s",dir);
-    if ((p=strrchr(pdir,FILEPATHSEP))) {
-        *p='\0';
-        if (!(fp=fopen(pdir,"r"))) {
-            if (!od_rtk_rtkcmn_mkdir_r(pdir)) return 0;
-        }
-        else fclose(fp);
-    }
-    if (!mkdir(dir,0777)||errno==EEXIST) return 1;
-#endif
-    trace(2,"directory generation error: dir=%s\n",dir);
-    return 0;
+    (void)dir;
+    return 0; /* Directory creation unavailable. */
 }
 /* create directory ------------------------------------------------------------
 * create directory if not exists
@@ -7199,18 +6879,10 @@ extern int rtk_uncompress(const char *file, char *uncfile)
         strcpy(uncfile,tmpfile); uncfile[p-tmpfile]='\0';
         strcpy(buff,tmpfile);
         fname=buff;
-#ifdef WIN32
-        if ((p=strrchr(buff,'\\'))) {
-            *p='\0'; dir=fname; fname=p+1;
-        }
-        sprintf(cmd,"set PATH=%%CD%%;%%PATH%% & cd /D \"%s\" & tar -xf \"%s\"",
-                dir,fname);
-#else
         if ((p=strrchr(buff,'/'))) {
             *p='\0'; dir=fname; fname=p+1;
         }
         sprintf(cmd,"tar -C \"%s\" -xf \"%s\"",dir,tmpfile);
-#endif
         if (execcmd(cmd)) {
             if (stat) remove(tmpfile);
             return -1;
@@ -17669,7 +17341,7 @@ static void od_decode_frame(od_context_t *ctx, const uint8_t *frame, size_t size
 
 od_config_t od_default_config(void)
 {
-    od_config_t config = {3,2,-1,2048};
+    od_config_t config = {30,3,-1,2048};
     return config;
 }
 

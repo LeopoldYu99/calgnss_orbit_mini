@@ -9,6 +9,7 @@ static od_context_t *test_create(uint32_t capacity, int64_t reference)
     od_config_t config = od_default_config();
     od_context_t *ctx = NULL;
     config.observation_capacity = capacity;
+    config.fit_degree = 2; /* Existing streaming regressions use quadratic fits. */
     config.nmea_reference_utc_ms = reference;
     CHECK(od_create(&config,&ctx) == OD_OK);
     return ctx;
@@ -70,6 +71,41 @@ static void test_same(const od_j2000_state_t *a, const od_j2000_state_t *b)
     }
 }
 
+static void test_default_config(void)
+{
+    od_config_t cfg = od_default_config();
+    od_context_t *implicit = NULL, *explicit = NULL, *tail = NULL;
+    od_j2000_state_t a, b;
+    char data[256];
+    int i;
+    CHECK(cfg.observation_capacity == 30 && cfg.fit_degree == 3);
+    CHECK(od_create(NULL, &implicit) == OD_OK);
+    CHECK(od_create(&cfg, &explicit) == OD_OK);
+    CHECK(od_create(&cfg, &tail) == OD_OK);
+    test_rmc(data);
+    test_send(implicit, data, 1); test_send(explicit, data, 0); test_send(tail, data, 0);
+    for (i = 0; i < 40; ++i) {
+        od_feed_info_t info;
+        test_gga(i, data);
+        info = test_send(implicit, data, 1);
+        CHECK(info.accepted_observations == 1 && info.rejected_records == 0);
+        CHECK(info.buffered_observations == (uint32_t)(i < 30 ? i + 1 : 30));
+        test_send(explicit, data, 0);
+        CHECK(od_get_orbit(implicit, &a) == (i < 3 ? OD_NOT_READY : OD_OK));
+        CHECK(od_get_orbit(explicit, &b) == (i < 3 ? OD_NOT_READY : OD_OK));
+        if (i >= 3) test_same(&a, &b);
+        if (i >= 10) test_send(tail, data, 0);
+    }
+    CHECK(od_get_orbit(tail, &b) == OD_OK); test_same(&a, &b);
+    CHECK(od_reset(implicit) == OD_OK);
+    test_rmc(data); test_send(implicit, data, 0);
+    for (i = 0; i < 4; ++i) {
+        test_gga(i, data); test_send(implicit, data, 0);
+        CHECK(od_get_orbit(implicit, &a) == (i < 3 ? OD_NOT_READY : OD_OK));
+    }
+    od_destroy(implicit); od_destroy(explicit); od_destroy(tail);
+}
+
 static void test_api(void)
 {
     od_context_t *raw=NULL, *ctx, *midnight;
@@ -80,6 +116,7 @@ static void test_api(void)
     const uint32_t capacities[]={3,5,10};
     const uint8_t frame[]={0xD3,0,4,0x43,0x50,0,0,0x44,0xFE,0x2E};
     uint32_t rejected=0;
+    test_default_config();
     cfg.observation_capacity=2;
     CHECK(od_create(&cfg,&raw)==OD_ERROR_ARGUMENT && !raw);
     cfg.fit_degree=1;
